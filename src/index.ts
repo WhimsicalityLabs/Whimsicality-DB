@@ -4,7 +4,6 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from '@model
 import { openDatabase, defaultStorageDir } from './database.js'
 import { Store, MAX_CONTENT_CHARS, MAX_TEXT_CHARS, MAX_IDENTIFIER_CHARS, MAX_TAGS, MAX_TAG_CHARS, DEFAULT_READ_LENGTH, DEFAULT_LIMIT, validateId, validateText, validateTags } from './store.js'
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
 const require = createRequire(import.meta.url)
 const VERSION = require('../package.json').version as string
 
@@ -157,7 +156,7 @@ function getStorageDir(): string {
   return defaultStorageDir()
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const storageDir = getStorageDir()
   const db = openDatabase(storageDir)
   const store = new Store(db)
@@ -192,11 +191,4 @@ async function main(): Promise<void> {
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
-    process.stderr.write(`whimsicality-db: fatal error\n${error instanceof Error ? error.message : String(error)}\n`)
-    process.exit(1)
-  })
 }
