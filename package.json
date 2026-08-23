@@ -1,6 +1,6 @@
 {
   "name": "whimsicality-db",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SQLite-backed MCP server with FTS5 full-text search for truly infinite agent context. Session tracking, event logging, and paged retrieval for long-horizon tasks.",
   "type": "module",
   "main": "lib/index.js",
