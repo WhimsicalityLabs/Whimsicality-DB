@@ -21,6 +21,9 @@ const MAX_TAG_CHARS = 256
 const DEFAULT_READ_LENGTH = 8_000
 const DEFAULT_LIMIT = 100
 
+const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed'])
+const SESSION_STATUSES = new Set(['active', 'paused', 'completed', 'abandoned'])
+
 function validateId(id: string, name: string): string {
   if (!id || id.length === 0) throw new Error(`Argument "${name}" must be a non-empty string`)
   if (id.length > MAX_IDENTIFIER_CHARS) throw new Error(`Argument "${name}" exceeds maximum length of ${MAX_IDENTIFIER_CHARS}`)
@@ -46,8 +49,24 @@ function validateTags(tags: unknown): string[] {
   return result
 }
 
+function validateTodoStatus(status: string): string {
+  if (!TODO_STATUSES.has(status)) throw new Error(`Invalid todo status "${status}". Must be one of: ${[...TODO_STATUSES].join(', ')}`)
+  return status
+}
+
+function validateSessionStatus(status: string): string {
+  if (!SESSION_STATUSES.has(status)) throw new Error(`Invalid session status "${status}". Must be one of: ${[...SESSION_STATUSES].join(', ')}`)
+  return status
+}
+
 function parseTags(json: string): string[] {
   try { return JSON.parse(json) as string[] } catch { return [] }
+}
+
+function toFtsQuery(raw: string): string {
+  const terms = raw.match(/[\p{L}\p{N}_]+/gu) ?? []
+  if (terms.length === 0) throw new Error('query has no searchable terms')
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ')
 }
 
 export class Store {
@@ -55,6 +74,12 @@ export class Store {
 
   constructor(db: Database.Database) {
     this.db = db
+  }
+
+  private syncTags(tagTable: string, idCol: string, parentId: number, tags: string[]): void {
+    this.db.prepare(`DELETE FROM ${tagTable} WHERE ${idCol} = ?`).run(parentId)
+    const insert = this.db.prepare(`INSERT INTO ${tagTable} (${idCol}, tag) VALUES (?, ?)`)
+    for (const tag of tags) insert.run(parentId, tag)
   }
 
   // ─── Memory ───
@@ -89,15 +114,16 @@ export class Store {
     return { deleted: result.changes > 0 }
   }
 
-  memorySearch(query: string, topK: number): SearchResult[] {
+  memorySearch(query: string, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     const rows = this.db.prepare(`
-      SELECT m.key AS id, m.namespace, m.value, bm25(memory_fts) AS score
+      SELECT m.key AS id, m.namespace, m.value, -bm25(memory_fts) AS score
       FROM memory_fts JOIN memory m ON m.id = memory_fts.rowid
       WHERE memory_fts MATCH ?
-      ORDER BY score
+      ORDER BY score DESC
       LIMIT ?
-    `).all(query, topK) as SearchResult[]
+    `).all(ftsQuery, topK) as SearchResult[]
     return rows
   }
 
@@ -133,15 +159,18 @@ export class Store {
     return { deleted: result.changes > 0 }
   }
 
-  docSearch(query: string, topK: number): SearchResult[] {
+  docSearch(query: string, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     const rows = this.db.prepare(`
-      SELECT d.doc_id AS id, d.language, d.description, substr(d.text, max(1, snippet(docs_fts, 0, '<<', '>>', '...', 20) - 350), 700) AS excerpt, bm25(docs_fts) AS score
+      SELECT d.doc_id AS id, d.language, d.description,
+             snippet(docs_fts, 0, '<<', '>>', '…', 48) AS excerpt,
+             -bm25(docs_fts) AS score
       FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid
       WHERE docs_fts MATCH ?
-      ORDER BY score
+      ORDER BY score DESC
       LIMIT ?
-    `).all(query, topK) as SearchResult[]
+    `).all(ftsQuery, topK) as SearchResult[]
     return rows
   }
 
@@ -155,11 +184,16 @@ export class Store {
     const compressedSize = compressed.length
     const tagsJson = JSON.stringify(tags)
     const ts = now()
-    this.db.prepare(`
-      INSERT INTO cache (chunk_id, topic, summary, tags, content, original_size, compressed_size, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(chunk_id) DO UPDATE SET topic = excluded.topic, summary = excluded.summary, tags = excluded.tags, content = excluded.content, original_size = excluded.original_size, compressed_size = excluded.compressed_size, updated_at = excluded.updated_at
-    `).run(chunkId, topic, summary, tagsJson, compressed, originalSize, compressedSize, ts, ts)
+    const tx = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        INSERT INTO cache (chunk_id, topic, summary, tags, content, original_size, compressed_size, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chunk_id) DO UPDATE SET topic = excluded.topic, summary = excluded.summary, tags = excluded.tags, content = excluded.content, original_size = excluded.original_size, compressed_size = excluded.compressed_size, updated_at = excluded.updated_at
+      `).run(chunkId, topic, summary, tagsJson, compressed, originalSize, compressedSize, ts, ts)
+      const cacheId = Number(result.lastInsertRowid)
+      this.syncTags('cache_tags', 'cache_id', cacheId, tags)
+    })
+    tx()
     return { id: chunkId, original_size: originalSize, compressed_size: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
   }
 
@@ -183,15 +217,22 @@ export class Store {
     }
   }
 
-  cacheIndex(topicFilter: string | null, limit: number): string {
+  cacheIndex(topicFilter: string | null, tagFilter: string | null, limit: number): string {
     let rows: { chunk_id: string; topic: string; summary: string }[]
-    if (topicFilter) {
+    if (tagFilter) {
+      rows = this.db.prepare(`
+        SELECT c.chunk_id, c.topic, c.summary FROM cache c
+        JOIN cache_tags ct ON ct.cache_id = c.id
+        WHERE ct.tag = ?
+        ORDER BY c.updated_at DESC LIMIT ?
+      `).all(tagFilter, limit) as { chunk_id: string; topic: string; summary: string }[]
+    } else if (topicFilter) {
       const filter = `%${topicFilter}%`
       rows = this.db.prepare(`
         SELECT chunk_id, topic, summary FROM cache
-        WHERE topic LIKE ? OR summary LIKE ? OR tags LIKE ?
+        WHERE topic LIKE ? OR summary LIKE ?
         ORDER BY updated_at DESC LIMIT ?
-      `).all(filter, filter, filter, limit) as { chunk_id: string; topic: string; summary: string }[]
+      `).all(filter, filter, limit) as { chunk_id: string; topic: string; summary: string }[]
     } else {
       rows = this.db.prepare('SELECT chunk_id, topic, summary FROM cache ORDER BY updated_at DESC LIMIT ?').all(limit) as { chunk_id: string; topic: string; summary: string }[]
     }
@@ -202,14 +243,15 @@ export class Store {
     return `${table}\n\n~${tokens} tokens. Use db_cache_read with an ID to retrieve content (supports offset+length for paging).`
   }
 
-  cacheSearch(query: string, topK: number): SearchResult[] {
+  cacheSearch(query: string, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     const rows = this.db.prepare(`
-      SELECT c.chunk_id AS id, c.topic, c.summary, bm25(cache_fts) AS score
+      SELECT c.chunk_id AS id, c.topic, c.summary, -bm25(cache_fts) AS score
       FROM cache_fts JOIN cache c ON c.id = cache_fts.rowid
       WHERE cache_fts MATCH ?
-      ORDER BY score LIMIT ?
-    `).all(query, topK) as SearchResult[]
+      ORDER BY score DESC LIMIT ?
+    `).all(ftsQuery, topK) as SearchResult[]
     return rows
   }
 
@@ -234,22 +276,28 @@ export class Store {
   todoAdd(title: string, description: string, priority: number, tags: string[], sessionId: string | null): { id: number } {
     validateText(title, 'title', 10_000)
     const ts = now()
-    const result = this.db.prepare(`
-      INSERT INTO todos (title, description, status, priority, tags, session_id, created_at, updated_at)
-      VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
-    `).run(title, description, priority, JSON.stringify(tags), sessionId, ts, ts)
-    return { id: Number(result.lastInsertRowid) }
+    const tagsJson = JSON.stringify(tags)
+    const tx = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        INSERT INTO todos (title, description, status, priority, tags, session_id, created_at, updated_at)
+        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+      `).run(title, description, priority, tagsJson, sessionId, ts, ts)
+      const todoId = Number(result.lastInsertRowid)
+      this.syncTags('todo_tags', 'todo_id', todoId, tags)
+      return todoId
+    })
+    return { id: tx() }
   }
 
   todoList(status: string | null, tag: string | null, sessionId: string | null, limit: number): TodoEntry[] {
-    let sql = 'SELECT id, title, description, status, priority, tags, session_id, created_at, updated_at FROM todos'
+    let sql = 'SELECT DISTINCT t.id, t.title, t.description, t.status, t.priority, t.tags, t.session_id, t.created_at, t.updated_at FROM todos t'
     const conditions: string[] = []
     const params: unknown[] = []
-    if (status) { conditions.push('status = ?'); params.push(status) }
-    if (tag) { conditions.push('tags LIKE ?'); params.push(`%"${tag}"%`) }
-    if (sessionId) { conditions.push('session_id = ?'); params.push(sessionId) }
+    if (tag) { sql += ' JOIN todo_tags tt ON tt.todo_id = t.id'; conditions.push('tt.tag = ?'); params.push(tag) }
+    if (status) { conditions.push('t.status = ?'); params.push(status) }
+    if (sessionId) { conditions.push('t.session_id = ?'); params.push(sessionId) }
     if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ')
-    sql += ' ORDER BY priority DESC, created_at ASC LIMIT ?'
+    sql += ' ORDER BY t.priority DESC, t.created_at ASC LIMIT ?'
     params.push(limit)
     const rows = this.db.prepare(sql).all(...params) as (Omit<TodoEntry, 'tags'> & { tags: string })[]
     return rows.map((r) => ({ ...r, tags: parseTags(r.tags) }))
@@ -258,10 +306,11 @@ export class Store {
   todoUpdate(id: number, status: string | null, title: string | null, description: string | null, priority: number | null): { updated: boolean } {
     const existing = this.db.prepare('SELECT id FROM todos WHERE id = ?').get(id)
     if (!existing) throw new Error(`not found: todo ${id}`)
+    if (status !== null) validateTodoStatus(status)
     const sets: string[] = ['updated_at = ?']
     const params: unknown[] = [now()]
-    if (status) { sets.push('status = ?'); params.push(status) }
-    if (title) { sets.push('title = ?'); params.push(title) }
+    if (status !== null) { sets.push('status = ?'); params.push(status) }
+    if (title !== null) { sets.push('title = ?'); params.push(title) }
     if (description !== null) { sets.push('description = ?'); params.push(description) }
     if (priority !== null) { sets.push('priority = ?'); params.push(priority) }
     params.push(id)
@@ -274,14 +323,15 @@ export class Store {
     return { deleted: result.changes > 0 }
   }
 
-  todoSearch(query: string, topK: number): SearchResult[] {
+  todoSearch(query: string, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     const rows = this.db.prepare(`
-      SELECT t.id, t.title, t.status, t.priority, bm25(todos_fts) AS score
+      SELECT t.id, t.title, t.status, t.priority, -bm25(todos_fts) AS score
       FROM todos_fts JOIN todos t ON t.id = todos_fts.rowid
       WHERE todos_fts MATCH ?
-      ORDER BY score LIMIT ?
-    `).all(query, topK) as SearchResult[]
+      ORDER BY score DESC LIMIT ?
+    `).all(ftsQuery, topK) as SearchResult[]
     return rows
   }
 
@@ -292,38 +342,49 @@ export class Store {
     validateText(title, 'title', 10_000)
     validateText(content, 'content', MAX_CONTENT_CHARS)
     const ts = now()
-    this.db.prepare(`
-      INSERT INTO context_entries (entry_id, title, content, tags, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(entry_id) DO UPDATE SET title = excluded.title, content = excluded.content, tags = excluded.tags, source = excluded.source, updated_at = excluded.updated_at
-    `).run(entryId, title, content, JSON.stringify(tags), source, ts, ts)
+    const tagsJson = JSON.stringify(tags)
+    const tx = this.db.transaction(() => {
+      const result = this.db.prepare(`
+        INSERT INTO context_entries (entry_id, title, content, tags, source, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entry_id) DO UPDATE SET title = excluded.title, content = excluded.content, tags = excluded.tags, source = excluded.source, updated_at = excluded.updated_at
+      `).run(entryId, title, content, tagsJson, source, ts, ts)
+      const contextId = Number(result.lastInsertRowid)
+      this.syncTags('context_tags', 'context_id', contextId, tags)
+    })
+    tx()
     return { id: entryId }
   }
 
   contextGet(entryId: string): ContextEntry {
     validateId(entryId, 'entry_id')
-    const row = this.db.prepare('SELECT entry_id, title, content, tags, source, created_at, updated_at FROM context_entries WHERE entry_id = ?').get(entryId) as Omit<ContextEntry, 'tags'> & { tags: string }
+    const row = this.db.prepare('SELECT entry_id, title, content, tags, source, created_at, updated_at FROM context_entries WHERE entry_id = ?').get(entryId) as (Omit<ContextEntry, 'tags'> & { tags: string }) | undefined
     if (!row) throw new Error(`not found: ${entryId}`)
     return { ...row, tags: parseTags(row.tags) }
   }
 
   contextByTags(tags: string[], limit: number): ContextEntry[] {
     if (tags.length === 0) throw new Error('at least one tag required')
-    const conditions = tags.map(() => 'tags LIKE ?').join(' OR ')
-    const params: unknown[] = tags.map((t) => `%"${t}"%`)
-    params.push(limit)
-    const rows = this.db.prepare(`SELECT entry_id, title, content, tags, source, created_at, updated_at FROM context_entries WHERE ${conditions} ORDER BY updated_at DESC LIMIT ?`).all(...params) as (Omit<ContextEntry, 'tags'> & { tags: string })[]
+    const placeholders = tags.map(() => '?').join(', ')
+    const rows = this.db.prepare(`
+      SELECT DISTINCT ce.entry_id, ce.title, ce.content, ce.tags, ce.source, ce.created_at, ce.updated_at
+      FROM context_entries ce
+      JOIN context_tags ct ON ct.context_id = ce.id
+      WHERE ct.tag IN (${placeholders})
+      ORDER BY ce.updated_at DESC LIMIT ?
+    `).all(...tags, limit) as (Omit<ContextEntry, 'tags'> & { tags: string })[]
     return rows.map((r) => ({ ...r, tags: parseTags(r.tags) }))
   }
 
-  contextSearch(query: string, topK: number): SearchResult[] {
+  contextSearch(query: string, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     const rows = this.db.prepare(`
-      SELECT c.entry_id AS id, c.title, c.tags, bm25(context_fts) AS score
+      SELECT c.entry_id AS id, c.title, c.tags, -bm25(context_fts) AS score
       FROM context_fts JOIN context_entries c ON c.id = context_fts.rowid
       WHERE context_fts MATCH ?
-      ORDER BY score LIMIT ?
-    `).all(query, topK) as SearchResult[]
+      ORDER BY score DESC LIMIT ?
+    `).all(ftsQuery, topK) as SearchResult[]
     return rows
   }
 
@@ -367,10 +428,11 @@ export class Store {
     validateId(id, 'id')
     const existing = this.db.prepare('SELECT id FROM sessions WHERE id = ?').get(id)
     if (!existing) throw new Error(`not found: session ${id}`)
+    if (status !== null) validateSessionStatus(status)
     const sets: string[] = ['updated_at = ?']
     const params: unknown[] = [now()]
-    if (status) { sets.push('status = ?'); params.push(status) }
-    if (name) { sets.push('name = ?'); params.push(name) }
+    if (status !== null) { sets.push('status = ?'); params.push(status) }
+    if (name !== null) { sets.push('name = ?'); params.push(name) }
     if (description !== null) { sets.push('description = ?'); params.push(description) }
     params.push(id)
     this.db.prepare(`UPDATE sessions SET ${sets.join(', ')} WHERE id = ?`).run(...params)
@@ -402,16 +464,19 @@ export class Store {
     return this.db.prepare(sql).all(...params) as EventEntry[]
   }
 
-  eventSearch(query: string, sessionId: string | null, topK: number): SearchResult[] {
+  eventSearch(query: string, sessionId: string | null, topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
+    const ftsQuery = raw ? query : toFtsQuery(query)
     let sql = `
-      SELECT e.id, e.session_id, e.event_type, substr(e.content, 1, 200) AS excerpt, bm25(events_fts) AS score
+      SELECT e.id, e.session_id, e.event_type,
+             snippet(events_fts, 0, '<<', '>>', '…', 32) AS excerpt,
+             -bm25(events_fts) AS score
       FROM events_fts JOIN events e ON e.id = events_fts.rowid
       WHERE events_fts MATCH ?
     `
-    const params: unknown[] = [query]
+    const params: unknown[] = [ftsQuery]
     if (sessionId) { sql += ' AND e.session_id = ?'; params.push(sessionId) }
-    sql += ' ORDER BY score LIMIT ?'
+    sql += ' ORDER BY score DESC LIMIT ?'
     params.push(topK)
     return this.db.prepare(sql).all(...params) as SearchResult[]
   }
@@ -435,4 +500,4 @@ export class Store {
   }
 }
 
-export { MAX_CONTENT_CHARS, MAX_TEXT_CHARS, MAX_IDENTIFIER_CHARS, MAX_TAGS, MAX_TAG_CHARS, DEFAULT_READ_LENGTH, DEFAULT_LIMIT, validateId, validateText, validateTags }
+export { MAX_CONTENT_CHARS, MAX_TEXT_CHARS, MAX_IDENTIFIER_CHARS, MAX_TAGS, MAX_TAG_CHARS, DEFAULT_READ_LENGTH, DEFAULT_LIMIT, validateId, validateText, validateTags, toFtsQuery }

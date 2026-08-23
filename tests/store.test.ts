@@ -2,76 +2,42 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { openDatabase, closeDatabase } from '../src/database.js'
+import { Store } from '../src/store.js'
+import { dispatch } from '../src/index.js'
 
 interface RpcResponse {
-  id?: number
   result?: { content?: { text: string }[]; isError?: boolean }
   error?: unknown
 }
 
-class McpProcess {
-  private readonly child: ChildProcess
-  private buffer = ''
-  private nextId = 1
-  private readonly pending = new Map<number, { resolve: (value: RpcResponse) => void; reject: (error: Error) => void }>()
-  private stderr = ''
+class InProcessMcp {
+  private readonly store: Store
+  private readonly db: ReturnType<typeof openDatabase>
 
   constructor(storageDir: string) {
-    this.child = spawn('node', ['bin/whimsicality-db.js'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, WHIMSICALITY_DB_DIR: storageDir },
-    })
-    this.child.stdout?.on('data', (data: Buffer) => {
-      this.buffer += data.toString()
-      const lines = this.buffer.split('\n')
-      this.buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        if (!line.trim()) continue
-        try {
-          const msg = JSON.parse(line) as RpcResponse & { jsonrpc: string; method?: string }
-          if (msg.id !== undefined && this.pending.has(msg.id)) {
-            const handler = this.pending.get(msg.id)!
-            this.pending.delete(msg.id)
-            handler.resolve(msg)
-          }
-        } catch { }
+    this.db = openDatabase(storageDir)
+    this.store = new Store(this.db)
+  }
+
+  async call(_method: string, params: { name: string; arguments: Record<string, unknown> }): Promise<RpcResponse> {
+    try {
+      const result = dispatch(this.store, params.name, params.arguments ?? {})
+      return { result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } }
+    } catch (error) {
+      return {
+        result: {
+          content: [{ type: 'text', text: error instanceof Error ? error.message : String(error) }],
+          isError: true,
+        },
       }
-    })
-    this.child.stderr?.on('data', (data: Buffer) => { this.stderr += data.toString() })
+    }
   }
 
-  async call(method: string, params: unknown): Promise<RpcResponse> {
-    const id = this.nextId++
-    const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params })
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`no response. stderr: ${this.stderr}`))
-      }, 5000)
-      this.pending.set(id, {
-        resolve: (r) => { clearTimeout(timeout); resolve(r) },
-        reject: (e) => { clearTimeout(timeout); reject(e) },
-      })
-      this.child.stdin?.write(msg + '\n')
-    })
-  }
+  async init(): Promise<void> {}
 
-  async init(): Promise<void> {
-    await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1.0' } })
-  }
-
-  stop(): void {
-    this.child.kill()
-  }
-
-  async stopAndWait(): Promise<void> {
-    if (this.child.killed || this.child.exitCode !== null) return
-    this.child.kill()
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => { try { this.child.kill('SIGKILL') } catch { }; resolve() }, 3000)
-      this.child.once('exit', () => { clearTimeout(timer); resolve() })
-    })
+  close(): void {
+    closeDatabase(this.db)
   }
 }
 
@@ -85,25 +51,25 @@ function parsed<T>(response: RpcResponse): T {
 
 describe('whimsicality-db', () => {
   let dir: string
-  const servers: McpProcess[] = []
+  const servers: InProcessMcp[] = []
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'whim-db-test-'))
   })
 
-  afterEach(async () => {
-    for (const server of servers) await server.stopAndWait()
+  afterEach(() => {
+    for (const server of servers) server.close()
     servers.length = 0
     try { rmSync(dir, { recursive: true, force: true }) } catch { }
   })
 
-  function server(): McpProcess {
-    const proc = new McpProcess(dir)
+  function server(): InProcessMcp {
+    const proc = new InProcessMcp(dir)
     servers.push(proc)
     return proc
   }
 
-  async function readyServer(): Promise<McpProcess> {
+  async function readyServer(): Promise<InProcessMcp> {
     const proc = server()
     await proc.init()
     return proc
@@ -362,6 +328,213 @@ describe('whimsicality-db', () => {
       const mcp = await readyServer()
       const response = await mcp.call('tools/call', { name: 'db_context_add', arguments: { entry_id: 'e', title: 't', content: 'c', tags: Array.from({ length: 25 }, (_, i) => `tag${i}`) } })
       expect(response.result?.isError).toBe(true)
+    })
+  })
+
+  describe('FTS5 query escaping — nasty queries', () => {
+    const nastyQueries = [
+      "what's the plan?",
+      'C++',
+      'C#',
+      'plan AND',
+      'rust OR',
+      'NOT this',
+      'a AND b',
+      'a OR b',
+      'a NOT b',
+      'term*',
+      '"quoted"',
+      'col:value',
+      'a^b',
+      '(grouped)',
+      'a-b-c',
+      "don't",
+      "it's",
+      'path/to/file',
+      'http://example.com',
+      'email@test.com',
+      '100% done',
+      'a+b=c',
+      'multi   space',
+      '   leading',
+      'trailing   ',
+      '日本語 テスト',
+      'über café',
+      'naïve approach',
+      "won't break",
+      "can't stop won't stop",
+    ]
+
+    for (const query of nastyQueries) {
+      it(`handles query: ${JSON.stringify(query)}`, async () => {
+        const mcp = await readyServer()
+        await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k1', value: 'the system processes data and results from the rust kernel' } })
+        await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k2', value: 'a plan for C++ development with café access' } })
+        const response = await mcp.call('tools/call', { name: 'db_memory_search', arguments: { query } })
+        expect(response.result?.isError).not.toBe(true)
+        const result = parsed<{ results: unknown[] }>(response)
+        expect(Array.isArray(result.results)).toBe(true)
+      })
+    }
+
+    it('returns isError for query with no searchable terms', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k', value: 'some content' } })
+      const response = await mcp.call('tools/call', { name: 'db_memory_search', arguments: { query: '!!! ??? ...' } })
+      expect(response.result?.isError).toBe(true)
+    })
+
+    it('supports raw FTS5 operator syntax with raw:true', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k1', value: 'rust kernel storage system' } })
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k2', value: 'python web framework' } })
+      const response = await mcp.call('tools/call', { name: 'db_memory_search', arguments: { query: 'rust AND kernel', raw: true } })
+      expect(response.result?.isError).not.toBe(true)
+      const result = parsed<{ results: { id: string }[] }>(response)
+      expect(result.results.length).toBeGreaterThan(0)
+      expect(result.results[0]?.id).toBe('k1')
+    })
+
+    it('returns isError for invalid raw FTS5 syntax', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'k', value: 'content' } })
+      const response = await mcp.call('tools/call', { name: 'db_memory_search', arguments: { query: "what's the plan?", raw: true } })
+      expect(response.result?.isError).toBe(true)
+    })
+  })
+
+  describe('bm25 sign and snippet', () => {
+    it('returns positive scores (higher = better)', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'exact', value: 'rust kernel storage' } })
+      await mcp.call('tools/call', { name: 'db_memory_set', arguments: { key: 'partial', value: 'rust is a systems language for kernels' } })
+      const result = parsed<{ results: { id: string; score: number }[] }>(await mcp.call('tools/call', { name: 'db_memory_search', arguments: { query: 'rust kernel storage' } }))
+      expect(result.results.length).toBeGreaterThan(0)
+      for (const r of result.results) {
+        expect(r.score).toBeGreaterThanOrEqual(0)
+      }
+    })
+
+    it('doc excerpt is match-centered and contains the search term', async () => {
+      const mcp = await readyServer()
+      const padding = 'word '.repeat(500)
+      const text = `${padding}unique_marker_xyz${' word'.repeat(500)}`
+      await mcp.call('tools/call', { name: 'db_doc_save', arguments: { id: 'doc', text } })
+      const result = parsed<{ results: { id: string; excerpt: string }[] }>(await mcp.call('tools/call', { name: 'db_doc_search', arguments: { query: 'unique_marker_xyz' } }))
+      expect(result.results[0]?.id).toBe('doc')
+      expect(result.results[0]?.excerpt).toContain('unique_marker_xyz')
+      expect(result.results[0]?.excerpt.length).toBeLessThan(500)
+    })
+
+    it('event excerpt is match-centered', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_session_create', arguments: { id: 's1', name: 'Test' } })
+      const padding = 'A'.repeat(500)
+      await mcp.call('tools/call', { name: 'db_event_log', arguments: { session_id: 's1', event_type: 'note', content: `${padding} the special_marker_42 was found ${padding}` } })
+      const result = parsed<{ results: { excerpt: string }[] }>(await mcp.call('tools/call', { name: 'db_event_search', arguments: { query: 'special_marker_42', session_id: 's1' } }))
+      expect(result.results.length).toBeGreaterThan(0)
+      expect(result.results[0]?.excerpt).toContain('special_marker_42')
+    })
+  })
+
+  describe('status validation', () => {
+    it('rejects invalid todo status on update', async () => {
+      const mcp = await readyServer()
+      const addResult = parsed<{ id: number }>(await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Test' } }))
+      const response = await mcp.call('tools/call', { name: 'db_todo_update', arguments: { id: addResult.id, status: 'done' } })
+      expect(response.result?.isError).toBe(true)
+    })
+
+    it('rejects invalid session status on update', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_session_create', arguments: { id: 's1', name: 'Test' } })
+      const response = await mcp.call('tools/call', { name: 'db_session_update', arguments: { id: 's1', status: 'finished' } })
+      expect(response.result?.isError).toBe(true)
+    })
+
+    it('accepts all valid todo statuses', async () => {
+      const mcp = await readyServer()
+      const addResult = parsed<{ id: number }>(await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Test' } }))
+      for (const status of ['pending', 'in_progress', 'completed']) {
+        const response = await mcp.call('tools/call', { name: 'db_todo_update', arguments: { id: addResult.id, status } })
+        expect(response.result?.isError).not.toBe(true)
+      }
+    })
+
+    it('accepts all valid session statuses', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_session_create', arguments: { id: 's1', name: 'Test' } })
+      for (const status of ['active', 'paused', 'completed', 'abandoned']) {
+        const response = await mcp.call('tools/call', { name: 'db_session_update', arguments: { id: 's1', status } })
+        expect(response.result?.isError).not.toBe(true)
+      }
+    })
+  })
+
+  describe('tag join tables', () => {
+    it('cache_index filters by tag', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_cache_store', arguments: { id: 'a', content: 'auth', topic: 'auth', summary: 'JWT', tags: ['security'] } })
+      await mcp.call('tools/call', { name: 'db_cache_store', arguments: { id: 'b', content: 'db', topic: 'db', summary: 'Postgres', tags: ['database'] } })
+      const result = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'db_cache_index', arguments: { tag: 'security' } }))
+      expect(result.table).toContain('a')
+      expect(result.table).not.toContain('| b |')
+    })
+
+    it('todo_list filters by tag via join table', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Task A', tags: ['frontend', 'urgent'] } })
+      await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Task B', tags: ['backend'] } })
+      const result = parsed<{ results: { title: string }[] }>(await mcp.call('tools/call', { name: 'db_todo_list', arguments: { tag: 'urgent' } }))
+      expect(result.results.length).toBe(1)
+      expect(result.results[0]?.title).toBe('Task A')
+    })
+
+    it('context_by_tags uses join table', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_context_add', arguments: { entry_id: 'e1', title: 'A', content: 'a', tags: ['x', 'y'] } })
+      await mcp.call('tools/call', { name: 'db_context_add', arguments: { entry_id: 'e2', title: 'B', content: 'b', tags: ['y', 'z'] } })
+      await mcp.call('tools/call', { name: 'db_context_add', arguments: { entry_id: 'e3', title: 'C', content: 'c', tags: ['w'] } })
+      const result = parsed<{ results: { entry_id: string }[] }>(await mcp.call('tools/call', { name: 'db_context_by_tags', arguments: { tags: ['x', 'z'] } }))
+      const ids = result.results.map((r) => r.entry_id)
+      expect(ids).toContain('e1')
+      expect(ids).toContain('e2')
+      expect(ids).not.toContain('e3')
+    })
+
+    it('updating cache replaces tags in join table', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_cache_store', arguments: { id: 'c', content: 'content', topic: 't', summary: 's', tags: ['old'] } })
+      await mcp.call('tools/call', { name: 'db_cache_store', arguments: { id: 'c', content: 'content', topic: 't', summary: 's', tags: ['new'] } })
+      const oldResult = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'db_cache_index', arguments: { tag: 'old' } }))
+      expect(oldResult.table).toContain('0 entries')
+      const newResult = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'db_cache_index', arguments: { tag: 'new' } }))
+      expect(newResult.table).toContain('c')
+    })
+  })
+
+  describe('update truthiness — empty string clearing', () => {
+    it('todo_update can clear description with empty string', async () => {
+      const mcp = await readyServer()
+      const addResult = parsed<{ id: number }>(await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Test', description: 'Original description' } }))
+      await mcp.call('tools/call', { name: 'db_todo_update', arguments: { id: addResult.id, description: '' } })
+      const list = parsed<{ results: { description: string }[] }>(await mcp.call('tools/call', { name: 'db_todo_list', arguments: {} }))
+      expect(list.results[0]?.description).toBe('')
+    })
+
+    it('todo_update can clear title with empty string', async () => {
+      const mcp = await readyServer()
+      const addResult = parsed<{ id: number }>(await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'Original Title' } }))
+      const response = await mcp.call('tools/call', { name: 'db_todo_update', arguments: { id: addResult.id, title: '' } })
+      expect(response.result?.isError).not.toBe(true)
+    })
+
+    it('session_update can clear description with empty string', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_session_create', arguments: { id: 's1', name: 'Test', description: 'Original' } })
+      await mcp.call('tools/call', { name: 'db_session_update', arguments: { id: 's1', description: '' } })
+      const session = parsed<{ description: string }>(await mcp.call('tools/call', { name: 'db_session_get', arguments: { id: 's1' } }))
+      expect(session.description).toBe('')
     })
   })
 })

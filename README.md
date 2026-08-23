@@ -141,14 +141,30 @@ Session tracking for long-horizon tasks. Create a session, log events (decisions
 │  sessions     (no FTS — small, direct query)            │
 │  events       ─── events_fts (FTS5)                     │
 │                                                          │
+│  Tag join tables: cache_tags, todo_tags, context_tags   │
+│  Normalized tag storage with indexes (not JSON LIKE)    │
 │  Triggers keep FTS5 indexes in sync automatically.      │
 │  WAL mode allows concurrent readers + 1 writer.         │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Every table with text content has a corresponding FTS5 virtual table with triggers that keep the index in sync on insert/update/delete. Searches use SQLite's native `bm25()` function for ranking — no re-tokenization, no recomputation.
+Every table with text content has a corresponding FTS5 virtual table with triggers that keep the index in sync on insert/update/delete. Searches use SQLite's native `bm25()` function for ranking — no re-tokenization, no recomputation. Scores are negated (`-bm25()`) so higher = better.
+
+Tags are stored in normalized join tables (`cache_tags`, `todo_tags`, `context_tags`) with indexes — not JSON columns with `LIKE` scans. Tag queries are real indexed relational queries.
 
 The cache table stores content as brotli-compressed BLOBs. `db_cache_read` decompresses on demand with offset+length paging.
+
+### Native module note
+
+This package depends on `better-sqlite3`, which is a native Node.js addon. Installing it requires a C++ toolchain (compiler + linker). On most systems `npm install` handles this automatically via prebuilt binaries. If prebuilt binaries are unavailable for your platform, `node-gyp` will compile from source — you'll need Python 3 and a C++ compiler installed.
+
+### Schema migrations
+
+The database tracks its schema version in a `schema_version` table. On open, the server reads the current version and applies migrations sequentially. Version 1 databases are automatically migrated to version 2 (tag join tables, CHECK constraints on status columns). Future schema changes will follow the same pattern.
+
+### Fresh start
+
+This is a standalone storage format. There is no importer from `whimsicality-mcp`'s JSON files. If you're switching from the JSON-based server, start fresh — the data model is different.
 
 ## When to use which collection
 

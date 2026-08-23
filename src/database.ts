@@ -7,7 +7,7 @@ export interface SchemaVersion {
   version: number
 }
 
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -99,12 +99,21 @@ CREATE TRIGGER IF NOT EXISTS cache_au AFTER UPDATE ON cache BEGIN
   INSERT INTO cache_fts(rowid, topic, summary, tags) VALUES (new.id, new.topic, new.summary, new.tags);
 END;
 
+-- Cache tag join table (efficient tag filtering)
+CREATE TABLE IF NOT EXISTS cache_tags (
+  cache_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (cache_id) REFERENCES cache(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_cache_tags_tag ON cache_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_cache_tags_id ON cache_tags(cache_id);
+
 -- Todos: task tracking
 CREATE TABLE IF NOT EXISTS todos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'pending',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'completed')),
   priority INTEGER NOT NULL DEFAULT 0,
   tags TEXT NOT NULL DEFAULT '[]',
   session_id TEXT,
@@ -126,6 +135,15 @@ CREATE TRIGGER IF NOT EXISTS todos_au AFTER UPDATE ON todos BEGIN
   INSERT INTO todos_fts(todos_fts, rowid, title, description, tags) VALUES('delete', old.id, old.title, old.description, old.tags);
   INSERT INTO todos_fts(rowid, title, description, tags) VALUES (new.id, new.title, new.description, new.tags);
 END;
+
+-- Todo tag join table
+CREATE TABLE IF NOT EXISTS todo_tags (
+  todo_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_todo_tags_id ON todo_tags(todo_id);
 
 -- Context index: tagged content entries for pull-by-tag retrieval
 CREATE TABLE IF NOT EXISTS context_entries (
@@ -154,12 +172,21 @@ CREATE TRIGGER IF NOT EXISTS context_au AFTER UPDATE ON context_entries BEGIN
   INSERT INTO context_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
 END;
 
+-- Context tag join table
+CREATE TABLE IF NOT EXISTS context_tags (
+  context_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (context_id) REFERENCES context_entries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_context_tags_tag ON context_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_context_tags_id ON context_tags(context_id);
+
 -- Sessions: long-horizon task tracking
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed', 'abandoned')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -191,11 +218,55 @@ CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
 END;
 `
 
+const MIGRATION_V1_TO_V2 = `
+CREATE TABLE IF NOT EXISTS cache_tags (
+  cache_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (cache_id) REFERENCES cache(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_cache_tags_tag ON cache_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_cache_tags_id ON cache_tags(cache_id);
+
+CREATE TABLE IF NOT EXISTS todo_tags (
+  todo_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_todo_tags_id ON todo_tags(todo_id);
+
+CREATE TABLE IF NOT EXISTS context_tags (
+  context_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (context_id) REFERENCES context_entries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_context_tags_tag ON context_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_context_tags_id ON context_tags(context_id);
+`
+
 export function defaultStorageDir(): string {
   const base = join(homedir(), '.whimsicality')
   const newPath = join(base, 'db-storage')
   mkdirSync(newPath, { recursive: true })
   return newPath
+}
+
+function migrateV1ToV2(db: Database.Database): void {
+  db.exec(MIGRATION_V1_TO_V2)
+  const migrateTags = (table: string, idCol: string, tagTable: string, tagIdCol: string): void => {
+    const rows = db.prepare(`SELECT ${idCol} AS id, tags FROM ${table}`).all() as { id: number; tags: string }[]
+    const insert = db.prepare(`INSERT OR IGNORE INTO ${tagTable} (${tagIdCol}, tag) VALUES (?, ?)`)
+    for (const row of rows) {
+      let tags: string[] = []
+      try { tags = JSON.parse(row.tags) as string[] } catch { continue }
+      for (const tag of tags) {
+        if (typeof tag === 'string' && tag.length > 0) insert.run(row.id, tag)
+      }
+    }
+  }
+  migrateTags('cache', 'id', 'cache_tags', 'cache_id')
+  migrateTags('todos', 'id', 'todo_tags', 'todo_id')
+  migrateTags('context_entries', 'id', 'context_tags', 'context_id')
 }
 
 export function openDatabase(storageDir: string): Database.Database {
@@ -204,10 +275,21 @@ export function openDatabase(storageDir: string): Database.Database {
   db.pragma('journal_mode = WAL')
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
+  db.pragma('busy_timeout = 5000')
   db.exec(SCHEMA_SQL)
-  const versionRow = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as SchemaVersion | undefined
+  let versionRow = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as SchemaVersion | undefined
   if (!versionRow) {
     db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SCHEMA_VERSION)
+    versionRow = { version: SCHEMA_VERSION }
+  }
+  if (versionRow.version < 2) {
+    migrateV1ToV2(db)
+    db.prepare('UPDATE schema_version SET version = ?').run(SCHEMA_VERSION)
   }
   return db
+}
+
+export function closeDatabase(db: Database.Database): void {
+  try { db.pragma('wal_checkpoint(TRUNCATE)') } catch { }
+  db.close()
 }
