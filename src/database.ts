@@ -7,7 +7,7 @@ export interface SchemaVersion {
   version: number
 }
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL
 );
 
--- Memory: namespaced key-value store
 CREATE TABLE IF NOT EXISTS memory (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   namespace TEXT NOT NULL DEFAULT 'default',
@@ -44,71 +43,42 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
   INSERT INTO memory_fts(rowid, value) VALUES (new.id, new.value);
 END;
 
--- Documents: full-text searchable
-CREATE TABLE IF NOT EXISTS docs (
+CREATE TABLE IF NOT EXISTS entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  doc_id TEXT NOT NULL UNIQUE,
-  text TEXT NOT NULL,
-  language TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '',
+  entry_id TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL DEFAULT '',
+  content BLOB,
+  content_text TEXT,
+  is_compressed INTEGER NOT NULL DEFAULT 0,
+  original_size INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
-  text, content='docs', content_rowid='id', tokenize='unicode61'
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+  title, content_text, content='entries', content_rowid='id', tokenize='unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
-  INSERT INTO docs_fts(rowid, text) VALUES (new.id, new.text);
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO entries_fts(rowid, title, content_text) VALUES (new.id, new.title, new.content_text);
 END;
-CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
-  INSERT INTO docs_fts(docs_fts, rowid, text) VALUES('delete', old.id, old.text);
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, title, content_text) VALUES('delete', old.id, old.title, old.content_text);
 END;
-CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
-  INSERT INTO docs_fts(docs_fts, rowid, text) VALUES('delete', old.id, old.text);
-  INSERT INTO docs_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
--- Cache: compressed paged content
-CREATE TABLE IF NOT EXISTS cache (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  chunk_id TEXT NOT NULL UNIQUE,
-  topic TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  tags TEXT NOT NULL DEFAULT '[]',
-  content BLOB NOT NULL,
-  original_size INTEGER NOT NULL,
-  compressed_size INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS cache_fts USING fts5(
-  topic, summary, tags, content='cache', content_rowid='id', tokenize='unicode61'
-);
-
-CREATE TRIGGER IF NOT EXISTS cache_ai AFTER INSERT ON cache BEGIN
-  INSERT INTO cache_fts(rowid, topic, summary, tags) VALUES (new.id, new.topic, new.summary, new.tags);
-END;
-CREATE TRIGGER IF NOT EXISTS cache_ad AFTER DELETE ON cache BEGIN
-  INSERT INTO cache_fts(cache_fts, rowid, topic, summary, tags) VALUES('delete', old.id, old.topic, old.summary, old.tags);
-END;
-CREATE TRIGGER IF NOT EXISTS cache_au AFTER UPDATE ON cache BEGIN
-  INSERT INTO cache_fts(cache_fts, rowid, topic, summary, tags) VALUES('delete', old.id, old.topic, old.summary, old.tags);
-  INSERT INTO cache_fts(rowid, topic, summary, tags) VALUES (new.id, new.topic, new.summary, new.tags);
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, title, content_text) VALUES('delete', old.id, old.title, old.content_text);
+  INSERT INTO entries_fts(rowid, title, content_text) VALUES (new.id, new.title, new.content_text);
 END;
 
--- Cache tag join table (efficient tag filtering)
-CREATE TABLE IF NOT EXISTS cache_tags (
-  cache_id INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS entry_tags (
+  entry_id INTEGER NOT NULL,
   tag TEXT NOT NULL,
-  FOREIGN KEY (cache_id) REFERENCES cache(id) ON DELETE CASCADE
+  FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_cache_tags_tag ON cache_tags(tag);
-CREATE INDEX IF NOT EXISTS idx_cache_tags_id ON cache_tags(cache_id);
+CREATE INDEX IF NOT EXISTS idx_entry_tags_tag ON entry_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_entry_tags_id ON entry_tags(entry_id);
 
--- Todos: task tracking
 CREATE TABLE IF NOT EXISTS todos (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
@@ -136,7 +106,6 @@ CREATE TRIGGER IF NOT EXISTS todos_au AFTER UPDATE ON todos BEGIN
   INSERT INTO todos_fts(rowid, title, description, tags) VALUES (new.id, new.title, new.description, new.tags);
 END;
 
--- Todo tag join table
 CREATE TABLE IF NOT EXISTS todo_tags (
   todo_id INTEGER NOT NULL,
   tag TEXT NOT NULL,
@@ -145,43 +114,6 @@ CREATE TABLE IF NOT EXISTS todo_tags (
 CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_todo_tags_id ON todo_tags(todo_id);
 
--- Context index: tagged content entries for pull-by-tag retrieval
-CREATE TABLE IF NOT EXISTS context_entries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  entry_id TEXT NOT NULL UNIQUE,
-  title TEXT NOT NULL,
-  content TEXT NOT NULL,
-  tags TEXT NOT NULL DEFAULT '[]',
-  source TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS context_fts USING fts5(
-  title, content, tags, content='context_entries', content_rowid='id', tokenize='unicode61'
-);
-
-CREATE TRIGGER IF NOT EXISTS context_ai AFTER INSERT ON context_entries BEGIN
-  INSERT INTO context_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
-END;
-CREATE TRIGGER IF NOT EXISTS context_ad AFTER DELETE ON context_entries BEGIN
-  INSERT INTO context_fts(context_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
-END;
-CREATE TRIGGER IF NOT EXISTS context_au AFTER UPDATE ON context_entries BEGIN
-  INSERT INTO context_fts(context_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
-  INSERT INTO context_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
-END;
-
--- Context tag join table
-CREATE TABLE IF NOT EXISTS context_tags (
-  context_id INTEGER NOT NULL,
-  tag TEXT NOT NULL,
-  FOREIGN KEY (context_id) REFERENCES context_entries(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_context_tags_tag ON context_tags(tag);
-CREATE INDEX IF NOT EXISTS idx_context_tags_id ON context_tags(context_id);
-
--- Sessions: long-horizon task tracking
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -191,7 +123,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at TEXT NOT NULL
 );
 
--- Events: log within sessions
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT,
@@ -218,7 +149,15 @@ CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
 END;
 `
 
-const MIGRATION_V1_TO_V2 = `
+export function defaultStorageDir(): string {
+  const base = join(homedir(), '.whimsicality')
+  const newPath = join(base, 'db-storage')
+  mkdirSync(newPath, { recursive: true })
+  return newPath
+}
+
+function migrateV1ToV2(db: Database.Database): void {
+  db.exec(`
 CREATE TABLE IF NOT EXISTS cache_tags (
   cache_id INTEGER NOT NULL,
   tag TEXT NOT NULL,
@@ -242,17 +181,7 @@ CREATE TABLE IF NOT EXISTS context_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_context_tags_tag ON context_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_context_tags_id ON context_tags(context_id);
-`
-
-export function defaultStorageDir(): string {
-  const base = join(homedir(), '.whimsicality')
-  const newPath = join(base, 'db-storage')
-  mkdirSync(newPath, { recursive: true })
-  return newPath
-}
-
-function migrateV1ToV2(db: Database.Database): void {
-  db.exec(MIGRATION_V1_TO_V2)
+`)
   const migrateTags = (table: string, idCol: string, tagTable: string, tagIdCol: string): void => {
     const rows = db.prepare(`SELECT ${idCol} AS id, tags FROM ${table}`).all() as { id: number; tags: string }[]
     const insert = db.prepare(`INSERT OR IGNORE INTO ${tagTable} (${tagIdCol}, tag) VALUES (?, ?)`)
@@ -269,6 +198,82 @@ function migrateV1ToV2(db: Database.Database): void {
   migrateTags('context_entries', 'id', 'context_tags', 'context_id')
 }
 
+function migrateV2ToV3(db: Database.Database): void {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL DEFAULT '',
+  content BLOB,
+  content_text TEXT,
+  is_compressed INTEGER NOT NULL DEFAULT 0,
+  original_size INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+  title, content_text, content='entries', content_rowid='id', tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO entries_fts(rowid, title, content_text) VALUES (new.id, new.title, new.content_text);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, title, content_text) VALUES('delete', old.id, old.title, old.content_text);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, title, content_text) VALUES('delete', old.id, old.title, old.content_text);
+  INSERT INTO entries_fts(rowid, title, content_text) VALUES (new.id, new.title, new.content_text);
+END;
+
+CREATE TABLE IF NOT EXISTS entry_tags (
+  entry_id INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_entry_tags_tag ON entry_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_entry_tags_id ON entry_tags(entry_id);
+`)
+
+  const insertEntry = db.prepare(`
+    INSERT OR IGNORE INTO entries (entry_id, title, content, content_text, is_compressed, original_size, source, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+  const insertTag = db.prepare('INSERT OR IGNORE INTO entry_tags (entry_id, tag) VALUES (?, ?)')
+
+  const docs = db.prepare('SELECT doc_id, text, language, description, created_at, updated_at FROM docs').all() as { doc_id: string; text: string; language: string; description: string; created_at: string; updated_at: string }[]
+  for (const d of docs) {
+    insertEntry.run(d.doc_id, d.description, null, d.text, 0, d.text.length, d.language, d.created_at, d.updated_at)
+  }
+
+  const cache = db.prepare('SELECT chunk_id, topic, summary, content, original_size, created_at, updated_at FROM cache').all() as { chunk_id: string; topic: string; summary: string; content: Buffer; original_size: number; created_at: string; updated_at: string }[]
+  for (const c of cache) {
+    insertEntry.run(c.chunk_id, c.summary, c.content, c.topic, 1, c.original_size, '', c.created_at, c.updated_at)
+  }
+
+  const contexts = db.prepare('SELECT entry_id, title, content, source, created_at, updated_at FROM context_entries').all() as { entry_id: string; title: string; content: string; source: string; created_at: string; updated_at: string }[]
+  for (const c of contexts) {
+    insertEntry.run(c.entry_id, c.title, null, c.content, 0, c.content.length, c.source, c.created_at, c.updated_at)
+  }
+
+  const cacheTags = db.prepare('SELECT ct.tag, e.id FROM cache_tags ct JOIN cache c ON c.id = ct.cache_id JOIN entries e ON e.entry_id = c.chunk_id').all() as { tag: string; id: number }[]
+  for (const t of cacheTags) insertTag.run(t.id, t.tag)
+
+  const contextTags = db.prepare('SELECT ct.tag, e.id FROM context_tags ct JOIN context_entries ce ON ce.id = ct.context_id JOIN entries e ON e.entry_id = ce.entry_id').all() as { tag: string; id: number }[]
+  for (const t of contextTags) insertTag.run(t.id, t.tag)
+
+  db.exec(`
+DROP TRIGGER IF EXISTS docs_ai; DROP TRIGGER IF EXISTS docs_ad; DROP TRIGGER IF EXISTS docs_au;
+DROP TRIGGER IF EXISTS cache_ai; DROP TRIGGER IF EXISTS cache_ad; DROP TRIGGER IF EXISTS cache_au;
+DROP TRIGGER IF EXISTS context_ai; DROP TRIGGER IF EXISTS context_ad; DROP TRIGGER IF EXISTS context_au;
+DROP TABLE IF EXISTS docs_fts; DROP TABLE IF EXISTS cache_fts; DROP TABLE IF EXISTS context_fts;
+DROP TABLE IF EXISTS cache_tags; DROP TABLE IF EXISTS context_tags;
+DROP TABLE IF EXISTS docs; DROP TABLE IF EXISTS cache; DROP TABLE IF EXISTS context_entries;
+`)
+}
+
 export function openDatabase(storageDir: string): Database.Database {
   const dbPath = join(storageDir, 'whimsicality.db')
   const db = new Database(dbPath)
@@ -279,13 +284,20 @@ export function openDatabase(storageDir: string): Database.Database {
   db.exec(SCHEMA_SQL)
   let versionRow = db.prepare('SELECT version FROM schema_version LIMIT 1').get() as SchemaVersion | undefined
   if (!versionRow) {
-    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(SCHEMA_VERSION)
-    versionRow = { version: SCHEMA_VERSION }
+    const hasOldTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('docs','cache','context_entries')").get() as { name: string } | undefined
+    const initialVersion = hasOldTables ? 2 : SCHEMA_VERSION
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(initialVersion)
+    versionRow = { version: initialVersion }
   }
   if (versionRow.version < 2) {
     migrateV1ToV2(db)
-    db.prepare('UPDATE schema_version SET version = ?').run(SCHEMA_VERSION)
+    versionRow = { version: 2 }
   }
+  if (versionRow.version < 3) {
+    migrateV2ToV3(db)
+    versionRow = { version: 3 }
+  }
+  db.prepare('UPDATE schema_version SET version = ?').run(SCHEMA_VERSION)
   return db
 }
 

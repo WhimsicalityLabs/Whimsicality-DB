@@ -1,10 +1,21 @@
 # whimsicality-db
 
-A SQLite-backed MCP server with FTS5 full-text search for truly infinite agent context. Session tracking, event logging, todo management, and tagged context index for long-horizon tasks and heavy workloads.
+A work journal for long-running agents. SQLite-backed MCP server with session tracking, event logging, and FTS5 search — so agents working across multiple context windows can recall decisions, search past events, and track their own progress.
+
+## Why this exists
+
+Agents doing long-horizon work have a problem: when the context window fills up, they lose track of what they decided, what they tried, and what's left to do. The conversation history scrolls off, and the agent re-derives conclusions it already reached.
+
+`whimsicality-db` solves this with a persistent work journal:
+
+1. **Create a session** for the task: `db_session_create({ id: "refactor-auth", name: "Refactor auth system" })`
+2. **Log events as they happen**: `db_event_log({ session_id: "refactor-auth", event_type: "decision", content: "Chose JWT over session cookies for stateless auth" })`
+3. **Search past decisions**: `db_search({ query: "auth decision", collections: ["events"] })`
+4. **Track todos across context windows**: `db_todo_add({ title: "Implement JWT verification", session_id: "refactor-auth" })`
+
+When the agent comes back after a context window reset, it searches the session log and picks up where it left off — without re-reading the entire conversation.
 
 ## Quick start
-
-Add to your MCP client config:
 
 ```json
 {
@@ -17,115 +28,72 @@ Add to your MCP client config:
 }
 ```
 
-Data is stored at `~/.whimsicality/db-storage/whimsicality.db` by default (SQLite with WAL mode). Set `WHIMSICALITY_DB_DIR` to override.
+Data is stored at `~/.whimsicality/db-storage/whimsicality.db` (SQLite, WAL mode). Set `WHIMSICALITY_DB_DIR` to override.
 
-## Why SQLite?
+## Migrating from whimsicality-mcp
 
-The companion server [`whimsicality-mcp`](https://github.com/WhimsicalityLabs/Whimsicality-MCP) uses a JSON file for memory and docs. It's simple and correct, but every write rewrites the whole file and every search re-tokenizes the whole corpus. Fine for hundreds of entries, unusable for tens of thousands.
+If you used the deprecated `whimsicality-mcp` package, import your data:
 
-This server uses SQLite with FTS5:
+```
+db_import({ source_dir: "~/.whimsicality/mcp-storage" })
+```
 
-| Problem | JSON file | SQLite + FTS5 |
-|---------|-----------|---------------|
-| Write cost | O(n) full rewrite | O(log n) B-tree insert |
-| Search cost | O(n) re-tokenize per query | O(log n) inverted index lookup |
-| BM25 | Hand-rolled, recomputed | Native FTS5 bm25() function |
-| Concurrency | Lockfile + atomic rename | WAL mode: concurrent readers + 1 writer |
-| Durability | fsync + rename | SQLite WAL + journal |
-| Scale wall | ~1,000 entries | ~1,000,000+ entries |
+Imports memory entries, documents, and compressed cache chunks into the unified entries table.
 
-## What's different from whimsicality-mcp
+## Tools (21 total, ~2,700 tokens of schema)
 
-Three new collections that the JSON server doesn't have:
-
-### Todos
-
-Task tracking with status (pending/in_progress/completed), priority, tags, and session linkage. The model can add tasks, update their status, search them, and filter by tag or session. Useful for long-horizon work where the model needs to track its own progress across context window boundaries.
-
-### Context index
-
-Tagged content entries that the model pulls by tag when needed. Instead of loading everything into context, the model stores reference material, architecture decisions, and domain knowledge with tags, then retrieves only what's relevant via `db_context_by_tags(["security", "auth"])`. This is the "multiple files with tags" pattern — the model has a dense catalog of tagged knowledge and pulls only what it needs.
-
-### Sessions + Events
-
-Session tracking for long-horizon tasks. Create a session, log events (decisions, milestones, errors, observations) as they happen, and search them later. When a task spans multiple context windows, the session log is the persistent memory that connects them — the model can search past decisions and events without re-deriving them.
-
-## Tools (32 total)
-
-### Memory — namespaced key-value store (5)
+### Memory — key-value facts (4)
 
 | Tool | Description |
 |---|---|
-| `db_memory_set` | Store persistent text. Namespaced key-value. |
-| `db_memory_get` | Retrieve by key and namespace. Error if not found. |
-| `db_memory_list` | List all keys in a namespace. |
-| `db_memory_delete` | Delete an entry. Returns deleted:false if absent. |
-| `db_memory_search` | FTS5 search across all memory values with BM25 ranking. |
+| `db_memory_set` | Store a key-value fact. Namespaced. |
+| `db_memory_get` | Recall a value by key. |
+| `db_memory_list` | List keys in a namespace. |
+| `db_memory_delete` | Delete a memory key. |
 
-### Documents — full-text searchable (5)
+### Entries — unified text store with auto-compression (5)
 
-| Tool | Description |
-|---|---|
-| `db_doc_save` | Save a document for FTS5 search. |
-| `db_doc_get` | Retrieve a full document by ID. |
-| `db_doc_search` | FTS5 search. Returns match-centered excerpts. |
-| `db_doc_list` | List saved document IDs. |
-| `db_doc_delete` | Delete a document. |
-
-### Cache — compressed paged content (7)
+Replaces the old docs, cache, and context collections. Small text is stored as-is and FTS5-indexed. Large text (>64KB) is auto-compressed with brotli and paged on read. Tags and source are optional.
 
 | Tool | Description |
 |---|---|
-| `db_cache_store` | Store content. Brotli-compressed. Returns compression stats. |
-| `db_cache_read` | Read by ID with paging (offset + length). Returns total_length + has_more. |
-| `db_cache_index` | Compact summary table with token estimate. |
-| `db_cache_search` | FTS5 search over cache metadata (topic, summary, tags). |
-| `db_cache_list` | List all cached chunk IDs. |
-| `db_cache_delete` | Delete a cached chunk. |
-| `db_cache_stats` | Entry count, total bytes, compression ratio. |
+| `db_entry_save` | Store text. Auto-compresses if large. Tags and source optional. |
+| `db_entry_read` | Read entry by ID. Supports paging via offset+length. |
+| `db_entry_list` | List entries. Optional tag filter. |
+| `db_entry_by_tags` | Get entries matching any of the given tags. |
+| `db_entry_delete` | Delete an entry. |
 
-### Todos — task tracking (5)
+### Todos — task tracking across context windows (4)
 
 | Tool | Description |
 |---|---|
-| `db_todo_add` | Add a todo with priority, tags, and optional session linkage. |
-| `db_todo_list` | List todos, filter by status/tag/session. Ordered by priority desc. |
-| `db_todo_update` | Update status, title, description, or priority. |
+| `db_todo_add` | Add a todo with priority, tags, session link. |
+| `db_todo_list` | List todos. Filter by status/tag/session. |
+| `db_todo_update` | Update a todo. Empty string clears a field. |
 | `db_todo_delete` | Delete a todo. |
-| `db_todo_search` | FTS5 search over todo titles and descriptions. |
 
-### Context index — tagged content retrieval (5)
-
-| Tool | Description |
-|---|---|
-| `db_context_add` | Add a tagged context entry (reference material, decisions, notes). |
-| `db_context_get` | Retrieve a context entry by ID. |
-| `db_context_by_tags` | Retrieve entries matching ANY of the specified tags. |
-| `db_context_search` | FTS5 search over context entries (title, content, tags). |
-| `db_context_delete` | Delete a context entry. |
-
-### Sessions — long-horizon task tracking (4)
+### Sessions — long-horizon task containers (3)
 
 | Tool | Description |
 |---|---|
-| `db_session_create` | Create or update a session. |
-| `db_session_get` | Get session details by ID. |
-| `db_session_list` | List sessions, optionally filtered by status. |
-| `db_session_update` | Update session status (active/paused/completed/abandoned). |
+| `db_session_create` | Create or update a session for long-horizon tasks. |
+| `db_session_list` | List sessions. Optional status filter. Pass id to get one. |
+| `db_session_update` | Update session. Empty string clears name/description. |
 
-### Events — session log (3)
-
-| Tool | Description |
-|---|---|
-| `db_event_log` | Log an event (decision, milestone, error, note, observation). |
-| `db_event_list` | List events, filter by session and/or type. |
-| `db_event_search` | FTS5 search over event content. |
-
-### Stats (1)
+### Events — session log (2)
 
 | Tool | Description |
 |---|---|
-| `db_stats` | Database statistics: counts per table + total DB size. |
+| `db_event_log` | Log an event in a session. FTS5-searchable. |
+| `db_event_list` | List events. Filter by session/type. |
+
+### Search + stats + import (3)
+
+| Tool | Description |
+|---|---|
+| `db_search` | Unified FTS5 search across collections. Returns ranked results with BM25 scores. |
+| `db_stats` | Database statistics: counts and size. |
+| `db_import` | Import data from whimsicality-mcp storage directory. |
 
 ## Architecture
 
@@ -134,45 +102,43 @@ Session tracking for long-horizon tasks. Create a session, log events (decisions
 │ SQLite Database (WAL mode)                               │
 │                                                          │
 │  memory       ─── memory_fts (FTS5)                     │
-│  docs         ─── docs_fts   (FTS5)                     │
-│  cache        ─── cache_fts  (FTS5)                     │
+│  entries      ─── entries_fts (FTS5)                    │
+│    ├─ small:  content_text (plain, FTS5-indexed)        │
+│    └─ large:  content (brotli BLOB) + title (FTS5)      │
+│  entry_tags   ── normalized tag join table               │
 │  todos        ─── todos_fts  (FTS5)                     │
-│  context_entries ── context_fts (FTS5)                  │
+│  todo_tags    ── normalized tag join table               │
 │  sessions     (no FTS — small, direct query)            │
 │  events       ─── events_fts (FTS5)                     │
 │                                                          │
-│  Tag join tables: cache_tags, todo_tags, context_tags   │
-│  Normalized tag storage with indexes (not JSON LIKE)    │
 │  Triggers keep FTS5 indexes in sync automatically.      │
-│  WAL mode allows concurrent readers + 1 writer.         │
+│  WAL mode: concurrent readers + 1 writer.               │
+│  CHECK constraints on status columns.                   │
+│  Schema version migrations (v1→v2→v3).                  │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Every table with text content has a corresponding FTS5 virtual table with triggers that keep the index in sync on insert/update/delete. Searches use SQLite's native `bm25()` function for ranking — no re-tokenization, no recomputation. Scores are negated (`-bm25()`) so higher = better.
+### Unified search
 
-Tags are stored in normalized join tables (`cache_tags`, `todo_tags`, `context_tags`) with indexes — not JSON columns with `LIKE` scans. Tag queries are real indexed relational queries.
+`db_search({ query, collections, top_k })` searches across memory, entries, todos, and events in one call. Results are merged and ranked by BM25 score (higher = better). Each result includes its collection, ID, score, and a match-centered excerpt where applicable.
 
-The cache table stores content as brotli-compressed BLOBs. `db_cache_read` decompresses on demand with offset+length paging.
+### Auto-compression
+
+Entries above 64KB are automatically brotli-compressed. The title/summary is stored as plain text for FTS5 indexing. `db_entry_read` decompresses on demand with offset+length paging.
 
 ### Native module note
 
-This package depends on `better-sqlite3`, which is a native Node.js addon. Installing it requires a C++ toolchain (compiler + linker). On most systems `npm install` handles this automatically via prebuilt binaries. If prebuilt binaries are unavailable for your platform, `node-gyp` will compile from source — you'll need Python 3 and a C++ compiler installed.
+This package depends on `better-sqlite3`, a native Node.js addon. `npm install` usually finds prebuilt binaries automatically. If not, `node-gyp` compiles from source — you'll need Python 3 and a C++ compiler. Node 22.5+ ships `node:sqlite` with FTS5 built in, which is a future zero-dependency path.
 
 ### Schema migrations
 
-The database tracks its schema version in a `schema_version` table. On open, the server reads the current version and applies migrations sequentially. Version 1 databases are automatically migrated to version 2 (tag join tables, CHECK constraints on status columns). Future schema changes will follow the same pattern.
-
-### Fresh start
-
-This is a standalone storage format. There is no importer from `whimsicality-mcp`'s JSON files. If you're switching from the JSON-based server, start fresh — the data model is different.
+The `schema_version` table tracks the database schema version. On open, the server reads the version and applies migrations sequentially: v1→v2 (tag join tables), v2→v3 (unified entries table merging docs/cache/context).
 
 ## When to use which collection
 
-- **Memory**: small key-value pairs you want to recall by exact key (facts, decisions, config)
-- **Docs**: documents you want to search by content (returns matching excerpts)
-- **Cache**: large content you want to page in on demand (compressed, paged reads)
-- **Todos**: tasks the model is tracking across context windows (status, priority, tags)
-- **Context index**: reference material the model pulls by tag when needed (architecture, domain knowledge, patterns)
+- **Memory**: small key-value pairs you want to recall by exact key (facts, config)
+- **Entries**: any text content — documents, references, large content. Auto-compresses, tags optional, paged reads
+- **Todos**: tasks the model is tracking across context windows
 - **Sessions**: long-horizon task containers (group events and todos)
 - **Events**: chronological log within a session (decisions, milestones, errors)
 
@@ -189,10 +155,9 @@ git clone https://github.com/WhimsicalityLabs/Whimsicality-DB.git
 cd Whimsicality-DB
 npm install
 npm test
-npm run typecheck
 ```
 
-The test suite covers all 32 tools: memory CRUD + search, docs CRUD + search, cache compression + paging + search, todos CRUD + filtering + search, context index add/get/by-tags/search, sessions + events, cross-process visibility, and input validation.
+67 tests: 64 in-process (store, search, entries, todos, sessions, events, validation, import) + 3 bin smoke (spawns the actual `bin/whimsicality-db.js` entry point).
 
 ## License
 

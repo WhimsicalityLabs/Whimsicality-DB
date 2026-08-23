@@ -1,17 +1,17 @@
 import type Database from 'better-sqlite3'
 import { brotliCompressSync, brotliDecompressSync } from 'node:zlib'
+import { readFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 const now = (): string => new Date().toISOString()
 
 export interface MemoryEntry { key: string; namespace: string; value: string; created_at: string; updated_at: string }
-export interface DocEntry { doc_id: string; text: string; language: string; description: string; created_at: string; updated_at: string }
-export interface CacheEntry { chunk_id: string; topic: string; summary: string; tags: string[]; original_size: number; compressed_size: number; created_at: string; updated_at: string }
+export interface EntryRecord { entry_id: string; title: string; is_compressed: boolean; original_size: number; source: string; tags: string[]; created_at: string; updated_at: string }
 export interface TodoEntry { id: number; title: string; description: string; status: string; priority: number; tags: string[]; session_id: string | null; created_at: string; updated_at: string }
-export interface ContextEntry { entry_id: string; title: string; content: string; tags: string[]; source: string; created_at: string; updated_at: string }
 export interface SessionEntry { id: string; name: string; description: string; status: string; created_at: string; updated_at: string }
 export interface EventEntry { id: number; session_id: string | null; event_type: string; content: string; metadata: string; created_at: string }
 
-export interface SearchResult { id: string | number; score: number; [key: string]: unknown }
+export interface SearchResult { collection: string; id: string | number; score: number; [key: string]: unknown }
 
 const MAX_CONTENT_CHARS = 5_000_000
 const MAX_TEXT_CHARS = 1_000_000
@@ -20,6 +20,7 @@ const MAX_TAGS = 20
 const MAX_TAG_CHARS = 256
 const DEFAULT_READ_LENGTH = 8_000
 const DEFAULT_LIMIT = 100
+const COMPRESS_THRESHOLD = 65_536
 
 const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed'])
 const SESSION_STATUSES = new Set(['active', 'paused', 'completed', 'abandoned'])
@@ -63,7 +64,7 @@ function parseTags(json: string): string[] {
   try { return JSON.parse(json) as string[] } catch { return [] }
 }
 
-function toFtsQuery(raw: string): string {
+export function toFtsQuery(raw: string): string {
   const terms = raw.match(/[\p{L}\p{N}_]+/gu) ?? []
   if (terms.length === 0) throw new Error('query has no searchable terms')
   return terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ')
@@ -76,10 +77,10 @@ export class Store {
     this.db = db
   }
 
-  private syncTags(tagTable: string, idCol: string, parentId: number, tags: string[]): void {
-    this.db.prepare(`DELETE FROM ${tagTable} WHERE ${idCol} = ?`).run(parentId)
-    const insert = this.db.prepare(`INSERT INTO ${tagTable} (${idCol}, tag) VALUES (?, ?)`)
-    for (const tag of tags) insert.run(parentId, tag)
+  private syncEntryTags(entryId: number, tags: string[]): void {
+    this.db.prepare('DELETE FROM entry_tags WHERE entry_id = ?').run(entryId)
+    const insert = this.db.prepare('INSERT INTO entry_tags (entry_id, tag) VALUES (?, ?)')
+    for (const tag of tags) insert.run(entryId, tag)
   }
 
   // ─── Memory ───
@@ -114,102 +115,50 @@ export class Store {
     return { deleted: result.changes > 0 }
   }
 
-  memorySearch(query: string, topK: number, raw: boolean): SearchResult[] {
-    validateText(query, 'query', 10_000)
-    const ftsQuery = raw ? query : toFtsQuery(query)
-    const rows = this.db.prepare(`
-      SELECT m.key AS id, m.namespace, m.value, -bm25(memory_fts) AS score
-      FROM memory_fts JOIN memory m ON m.id = memory_fts.rowid
-      WHERE memory_fts MATCH ?
-      ORDER BY score DESC
-      LIMIT ?
-    `).all(ftsQuery, topK) as SearchResult[]
-    return rows
-  }
+  // ─── Entries (unified: docs + cache + context) ───
 
-  // ─── Docs ───
-
-  docSave(docId: string, text: string, language: string, description: string): { saved: boolean } {
-    validateId(docId, 'id')
-    validateText(text, 'text')
+  entrySave(entryId: string, text: string, title: string, tags: string[], source: string, compress: boolean | null): { id: string; original_size: number; compressed_size: number; ratio: number } {
+    validateId(entryId, 'id')
+    validateText(text, 'text', MAX_CONTENT_CHARS)
+    const shouldCompress = compress === true || (compress === null && text.length > COMPRESS_THRESHOLD)
     const ts = now()
-    this.db.prepare(`
-      INSERT INTO docs (doc_id, text, language, description, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(doc_id) DO UPDATE SET text = excluded.text, language = excluded.language, description = excluded.description, updated_at = excluded.updated_at
-    `).run(docId, text, language, description, ts, ts)
-    return { saved: true }
-  }
-
-  docGet(docId: string): DocEntry {
-    validateId(docId, 'id')
-    const row = this.db.prepare('SELECT doc_id, text, language, description, created_at, updated_at FROM docs WHERE doc_id = ?').get(docId) as DocEntry | undefined
-    if (!row) throw new Error(`not found: ${docId}`)
-    return row
-  }
-
-  docList(): { ids: string[] } {
-    const rows = this.db.prepare('SELECT doc_id FROM docs ORDER BY doc_id').all() as { doc_id: string }[]
-    return { ids: rows.map((r) => r.doc_id) }
-  }
-
-  docDelete(docId: string): { deleted: boolean } {
-    validateId(docId, 'id')
-    const result = this.db.prepare('DELETE FROM docs WHERE doc_id = ?').run(docId)
-    return { deleted: result.changes > 0 }
-  }
-
-  docSearch(query: string, topK: number, raw: boolean): SearchResult[] {
-    validateText(query, 'query', 10_000)
-    const ftsQuery = raw ? query : toFtsQuery(query)
-    const rows = this.db.prepare(`
-      SELECT d.doc_id AS id, d.language, d.description,
-             snippet(docs_fts, 0, '<<', '>>', '…', 48) AS excerpt,
-             -bm25(docs_fts) AS score
-      FROM docs_fts JOIN docs d ON d.id = docs_fts.rowid
-      WHERE docs_fts MATCH ?
-      ORDER BY score DESC
-      LIMIT ?
-    `).all(ftsQuery, topK) as SearchResult[]
-    return rows
-  }
-
-  // ─── Cache (compressed paged content) ───
-
-  cacheStore(chunkId: string, content: string, topic: string, summary: string, tags: string[]): { id: string; original_size: number; compressed_size: number; ratio: number } {
-    validateId(chunkId, 'id')
-    validateText(content, 'content', MAX_CONTENT_CHARS)
-    const compressed = brotliCompressSync(Buffer.from(content, 'utf-8'))
-    const originalSize = Buffer.byteLength(content, 'utf-8')
-    const compressedSize = compressed.length
-    const tagsJson = JSON.stringify(tags)
-    const ts = now()
+    const originalSize = Buffer.byteLength(text, 'utf-8')
+    let contentBlob: Buffer | null = null
+    let contentText: string = text
+    let compressedSize = originalSize
+    if (shouldCompress) {
+      contentBlob = brotliCompressSync(Buffer.from(text, 'utf-8'))
+      compressedSize = contentBlob.length
+      contentText = title || text.slice(0, 200)
+    }
     const tx = this.db.transaction(() => {
       const result = this.db.prepare(`
-        INSERT INTO cache (chunk_id, topic, summary, tags, content, original_size, compressed_size, created_at, updated_at)
+        INSERT INTO entries (entry_id, title, content, content_text, is_compressed, original_size, source, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(chunk_id) DO UPDATE SET topic = excluded.topic, summary = excluded.summary, tags = excluded.tags, content = excluded.content, original_size = excluded.original_size, compressed_size = excluded.compressed_size, updated_at = excluded.updated_at
-      `).run(chunkId, topic, summary, tagsJson, compressed, originalSize, compressedSize, ts, ts)
-      const cacheId = Number(result.lastInsertRowid)
-      this.syncTags('cache_tags', 'cache_id', cacheId, tags)
+        ON CONFLICT(entry_id) DO UPDATE SET title = excluded.title, content = excluded.content, content_text = excluded.content_text, is_compressed = excluded.is_compressed, original_size = excluded.original_size, source = excluded.source, updated_at = excluded.updated_at
+      `).run(entryId, title, contentBlob, contentText, shouldCompress ? 1 : 0, originalSize, source, ts, ts)
+      const rowId = Number(result.lastInsertRowid)
+      this.syncEntryTags(rowId, tags)
     })
     tx()
-    return { id: chunkId, original_size: originalSize, compressed_size: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
+    return { id: entryId, original_size: originalSize, compressed_size: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
   }
 
-  cacheRead(chunkId: string, offset: number, length: number): { content: string; topic: string; summary: string; tags: string[]; offset: number; length: number; total_length: number; has_more: boolean } {
-    validateId(chunkId, 'id')
-    const row = this.db.prepare('SELECT content, topic, summary, tags, original_size FROM cache WHERE chunk_id = ?').get(chunkId) as { content: Buffer; topic: string; summary: string; tags: string; original_size: number } | undefined
-    if (!row) throw new Error(`not found: ${chunkId}`)
-    const fullContent = brotliDecompressSync(row.content).toString('utf-8')
+  entryRead(entryId: string, offset: number, length: number): { content: string; title: string; is_compressed: boolean; tags: string[]; source: string; offset: number; length: number; total_length: number; has_more: boolean } {
+    validateId(entryId, 'id')
+    const row = this.db.prepare('SELECT content, content_text, is_compressed, title, source, original_size FROM entries WHERE entry_id = ?').get(entryId) as { content: Buffer | null; content_text: string | null; is_compressed: number; title: string; source: string; original_size: number } | undefined
+    if (!row) throw new Error(`not found: ${entryId}`)
+    const fullContent = row.is_compressed ? brotliDecompressSync(row.content!).toString('utf-8') : (row.content_text ?? '')
     const totalLength = fullContent.length
     const start = Math.max(0, Math.min(offset, totalLength))
     const end = Math.min(start + length, totalLength)
+    const tagRows = this.db.prepare('SELECT tag FROM entry_tags WHERE entry_id = (SELECT id FROM entries WHERE entry_id = ?)').all(entryId) as { tag: string }[]
     return {
       content: fullContent.slice(start, end),
-      topic: row.topic,
-      summary: row.summary,
-      tags: parseTags(row.tags),
+      title: row.title,
+      is_compressed: row.is_compressed === 1,
+      tags: tagRows.map((t) => t.tag),
+      source: row.source,
       offset: start,
       length: end - start,
       total_length: totalLength,
@@ -217,58 +166,46 @@ export class Store {
     }
   }
 
-  cacheIndex(topicFilter: string | null, tagFilter: string | null, limit: number): string {
-    let rows: { chunk_id: string; topic: string; summary: string }[]
+  entryList(tagFilter: string | null, limit: number): { results: EntryRecord[] } {
+    let sql = 'SELECT DISTINCT e.entry_id, e.title, e.is_compressed, e.original_size, e.source, e.created_at, e.updated_at FROM entries e'
+    const params: unknown[] = []
     if (tagFilter) {
-      rows = this.db.prepare(`
-        SELECT c.chunk_id, c.topic, c.summary FROM cache c
-        JOIN cache_tags ct ON ct.cache_id = c.id
-        WHERE ct.tag = ?
-        ORDER BY c.updated_at DESC LIMIT ?
-      `).all(tagFilter, limit) as { chunk_id: string; topic: string; summary: string }[]
-    } else if (topicFilter) {
-      const filter = `%${topicFilter}%`
-      rows = this.db.prepare(`
-        SELECT chunk_id, topic, summary FROM cache
-        WHERE topic LIKE ? OR summary LIKE ?
-        ORDER BY updated_at DESC LIMIT ?
-      `).all(filter, filter, limit) as { chunk_id: string; topic: string; summary: string }[]
-    } else {
-      rows = this.db.prepare('SELECT chunk_id, topic, summary FROM cache ORDER BY updated_at DESC LIMIT ?').all(limit) as { chunk_id: string; topic: string; summary: string }[]
+      sql += ' JOIN entry_tags et ON et.entry_id = e.id WHERE et.tag = ?'
+      params.push(tagFilter)
     }
-    if (rows.length === 0) return '## Context Cache (0 entries)\n(empty)'
-    const lines = rows.map((r) => `| ${r.chunk_id} | ${r.topic} | ${r.summary} |`)
-    const table = `## Context Cache (${rows.length} entries)\n| ID | Topic | Summary |\n|----|-------|---------|\n${lines.join('\n')}`
-    const tokens = Math.ceil(table.length / 4)
-    return `${table}\n\n~${tokens} tokens. Use db_cache_read with an ID to retrieve content (supports offset+length for paging).`
+    sql += ' ORDER BY e.updated_at DESC LIMIT ?'
+    params.push(limit)
+    const rows = this.db.prepare(sql).all(...params) as { entry_id: string; title: string; is_compressed: number; original_size: number; source: string; created_at: string; updated_at: string }[]
+    const result: EntryRecord[] = []
+    for (const r of rows) {
+      const tagRows = this.db.prepare('SELECT tag FROM entry_tags WHERE entry_id = (SELECT id FROM entries WHERE entry_id = ?)').all(r.entry_id) as { tag: string }[]
+      result.push({ entry_id: r.entry_id, title: r.title, is_compressed: r.is_compressed === 1, original_size: r.original_size, source: r.source, created_at: r.created_at, updated_at: r.updated_at, tags: tagRows.map((t) => t.tag) })
+    }
+    return { results: result }
   }
 
-  cacheSearch(query: string, topK: number, raw: boolean): SearchResult[] {
-    validateText(query, 'query', 10_000)
-    const ftsQuery = raw ? query : toFtsQuery(query)
+  entryByTags(tags: string[], limit: number): EntryRecord[] {
+    if (tags.length === 0) throw new Error('at least one tag required')
+    const placeholders = tags.map(() => '?').join(', ')
     const rows = this.db.prepare(`
-      SELECT c.chunk_id AS id, c.topic, c.summary, -bm25(cache_fts) AS score
-      FROM cache_fts JOIN cache c ON c.id = cache_fts.rowid
-      WHERE cache_fts MATCH ?
-      ORDER BY score DESC LIMIT ?
-    `).all(ftsQuery, topK) as SearchResult[]
-    return rows
+      SELECT DISTINCT e.entry_id, e.title, e.is_compressed, e.original_size, e.source, e.created_at, e.updated_at
+      FROM entries e
+      JOIN entry_tags et ON et.entry_id = e.id
+      WHERE et.tag IN (${placeholders})
+      ORDER BY e.updated_at DESC LIMIT ?
+    `).all(...tags, limit) as { entry_id: string; title: string; is_compressed: number; original_size: number; source: string; created_at: string; updated_at: string }[]
+    const result: EntryRecord[] = []
+    for (const r of rows) {
+      const tagRows = this.db.prepare('SELECT tag FROM entry_tags WHERE entry_id = (SELECT id FROM entries WHERE entry_id = ?)').all(r.entry_id) as { tag: string }[]
+      result.push({ entry_id: r.entry_id, title: r.title, is_compressed: r.is_compressed === 1, original_size: r.original_size, source: r.source, created_at: r.created_at, updated_at: r.updated_at, tags: tagRows.map((t) => t.tag) })
+    }
+    return result
   }
 
-  cacheList(): { ids: string[] } {
-    const rows = this.db.prepare('SELECT chunk_id FROM cache ORDER BY chunk_id').all() as { chunk_id: string }[]
-    return { ids: rows.map((r) => r.chunk_id) }
-  }
-
-  cacheDelete(chunkId: string): { deleted: boolean } {
-    validateId(chunkId, 'id')
-    const result = this.db.prepare('DELETE FROM cache WHERE chunk_id = ?').run(chunkId)
+  entryDelete(entryId: string): { deleted: boolean } {
+    validateId(entryId, 'id')
+    const result = this.db.prepare('DELETE FROM entries WHERE entry_id = ?').run(entryId)
     return { deleted: result.changes > 0 }
-  }
-
-  cacheStats(): { entries: number; total_original_bytes: number; total_compressed_bytes: number; ratio: number } {
-    const row = this.db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(original_size), 0) AS orig, COALESCE(SUM(compressed_size), 0) AS comp FROM cache').get() as { count: number; orig: number; comp: number }
-    return { entries: row.count, total_original_bytes: row.orig, total_compressed_bytes: row.comp, ratio: row.orig > 0 ? row.comp / row.orig : 0 }
   }
 
   // ─── Todos ───
@@ -283,10 +220,16 @@ export class Store {
         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
       `).run(title, description, priority, tagsJson, sessionId, ts, ts)
       const todoId = Number(result.lastInsertRowid)
-      this.syncTags('todo_tags', 'todo_id', todoId, tags)
+      this.syncTodoTags(todoId, tags)
       return todoId
     })
     return { id: tx() }
+  }
+
+  private syncTodoTags(todoId: number, tags: string[]): void {
+    this.db.prepare('DELETE FROM todo_tags WHERE todo_id = ?').run(todoId)
+    const insert = this.db.prepare('INSERT INTO todo_tags (todo_id, tag) VALUES (?, ?)')
+    for (const tag of tags) insert.run(todoId, tag)
   }
 
   todoList(status: string | null, tag: string | null, sessionId: string | null, limit: number): TodoEntry[] {
@@ -320,77 +263,6 @@ export class Store {
 
   todoDelete(id: number): { deleted: boolean } {
     const result = this.db.prepare('DELETE FROM todos WHERE id = ?').run(id)
-    return { deleted: result.changes > 0 }
-  }
-
-  todoSearch(query: string, topK: number, raw: boolean): SearchResult[] {
-    validateText(query, 'query', 10_000)
-    const ftsQuery = raw ? query : toFtsQuery(query)
-    const rows = this.db.prepare(`
-      SELECT t.id, t.title, t.status, t.priority, -bm25(todos_fts) AS score
-      FROM todos_fts JOIN todos t ON t.id = todos_fts.rowid
-      WHERE todos_fts MATCH ?
-      ORDER BY score DESC LIMIT ?
-    `).all(ftsQuery, topK) as SearchResult[]
-    return rows
-  }
-
-  // ─── Context Index (tagged entries) ───
-
-  contextAdd(entryId: string, title: string, content: string, tags: string[], source: string): { id: string } {
-    validateId(entryId, 'entry_id')
-    validateText(title, 'title', 10_000)
-    validateText(content, 'content', MAX_CONTENT_CHARS)
-    const ts = now()
-    const tagsJson = JSON.stringify(tags)
-    const tx = this.db.transaction(() => {
-      const result = this.db.prepare(`
-        INSERT INTO context_entries (entry_id, title, content, tags, source, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(entry_id) DO UPDATE SET title = excluded.title, content = excluded.content, tags = excluded.tags, source = excluded.source, updated_at = excluded.updated_at
-      `).run(entryId, title, content, tagsJson, source, ts, ts)
-      const contextId = Number(result.lastInsertRowid)
-      this.syncTags('context_tags', 'context_id', contextId, tags)
-    })
-    tx()
-    return { id: entryId }
-  }
-
-  contextGet(entryId: string): ContextEntry {
-    validateId(entryId, 'entry_id')
-    const row = this.db.prepare('SELECT entry_id, title, content, tags, source, created_at, updated_at FROM context_entries WHERE entry_id = ?').get(entryId) as (Omit<ContextEntry, 'tags'> & { tags: string }) | undefined
-    if (!row) throw new Error(`not found: ${entryId}`)
-    return { ...row, tags: parseTags(row.tags) }
-  }
-
-  contextByTags(tags: string[], limit: number): ContextEntry[] {
-    if (tags.length === 0) throw new Error('at least one tag required')
-    const placeholders = tags.map(() => '?').join(', ')
-    const rows = this.db.prepare(`
-      SELECT DISTINCT ce.entry_id, ce.title, ce.content, ce.tags, ce.source, ce.created_at, ce.updated_at
-      FROM context_entries ce
-      JOIN context_tags ct ON ct.context_id = ce.id
-      WHERE ct.tag IN (${placeholders})
-      ORDER BY ce.updated_at DESC LIMIT ?
-    `).all(...tags, limit) as (Omit<ContextEntry, 'tags'> & { tags: string })[]
-    return rows.map((r) => ({ ...r, tags: parseTags(r.tags) }))
-  }
-
-  contextSearch(query: string, topK: number, raw: boolean): SearchResult[] {
-    validateText(query, 'query', 10_000)
-    const ftsQuery = raw ? query : toFtsQuery(query)
-    const rows = this.db.prepare(`
-      SELECT c.entry_id AS id, c.title, c.tags, -bm25(context_fts) AS score
-      FROM context_fts JOIN context_entries c ON c.id = context_fts.rowid
-      WHERE context_fts MATCH ?
-      ORDER BY score DESC LIMIT ?
-    `).all(ftsQuery, topK) as SearchResult[]
-    return rows
-  }
-
-  contextDelete(entryId: string): { deleted: boolean } {
-    validateId(entryId, 'entry_id')
-    const result = this.db.prepare('DELETE FROM context_entries WHERE entry_id = ?').run(entryId)
     return { deleted: result.changes > 0 }
   }
 
@@ -464,40 +336,147 @@ export class Store {
     return this.db.prepare(sql).all(...params) as EventEntry[]
   }
 
-  eventSearch(query: string, sessionId: string | null, topK: number, raw: boolean): SearchResult[] {
+  // ─── Unified Search ───
+
+  search(query: string, collections: string[], topK: number, raw: boolean): SearchResult[] {
     validateText(query, 'query', 10_000)
     const ftsQuery = raw ? query : toFtsQuery(query)
-    let sql = `
-      SELECT e.id, e.session_id, e.event_type,
-             snippet(events_fts, 0, '<<', '>>', '…', 32) AS excerpt,
-             -bm25(events_fts) AS score
-      FROM events_fts JOIN events e ON e.id = events_fts.rowid
-      WHERE events_fts MATCH ?
-    `
-    const params: unknown[] = [ftsQuery]
-    if (sessionId) { sql += ' AND e.session_id = ?'; params.push(sessionId) }
-    sql += ' ORDER BY score DESC LIMIT ?'
-    params.push(topK)
-    return this.db.prepare(sql).all(...params) as SearchResult[]
+    const results: SearchResult[] = []
+    if (collections.includes('memory')) {
+      const rows = this.db.prepare(`
+        SELECT m.key AS id, 'memory' AS collection, m.namespace, m.value, -bm25(memory_fts) AS score
+        FROM memory_fts JOIN memory m ON m.id = memory_fts.rowid
+        WHERE memory_fts MATCH ?
+        ORDER BY score DESC LIMIT ?
+      `).all(ftsQuery, topK) as SearchResult[]
+      results.push(...rows)
+    }
+    if (collections.includes('entries')) {
+      const rows = this.db.prepare(`
+        SELECT e.entry_id AS id, 'entries' AS collection, e.title,
+               snippet(entries_fts, 1, '<<', '>>', '…', 48) AS excerpt,
+               -bm25(entries_fts) AS score
+        FROM entries_fts JOIN entries e ON e.id = entries_fts.rowid
+        WHERE entries_fts MATCH ?
+        ORDER BY score DESC LIMIT ?
+      `).all(ftsQuery, topK) as SearchResult[]
+      results.push(...rows)
+    }
+    if (collections.includes('todos')) {
+      const rows = this.db.prepare(`
+        SELECT t.id, 'todos' AS collection, t.title, t.status, -bm25(todos_fts) AS score
+        FROM todos_fts JOIN todos t ON t.id = todos_fts.rowid
+        WHERE todos_fts MATCH ?
+        ORDER BY score DESC LIMIT ?
+      `).all(ftsQuery, topK) as SearchResult[]
+      results.push(...rows)
+    }
+    if (collections.includes('events')) {
+      const rows = this.db.prepare(`
+        SELECT e.id, 'events' AS collection, e.event_type,
+               snippet(events_fts, 0, '<<', '>>', '…', 32) AS excerpt,
+               -bm25(events_fts) AS score
+        FROM events_fts JOIN events e ON e.id = events_fts.rowid
+        WHERE events_fts MATCH ?
+        ORDER BY score DESC LIMIT ?
+      `).all(ftsQuery, topK) as SearchResult[]
+      results.push(...rows)
+    }
+    return results.sort((a, b) => b.score - a.score).slice(0, topK)
   }
 
   // ─── Stats ───
 
-  stats(): { memory_count: number; doc_count: number; cache_count: number; todo_count: number; context_count: number; session_count: number; event_count: number; db_size_bytes: number } {
+  stats(): { memory_count: number; entry_count: number; todo_count: number; session_count: number; event_count: number; db_size_bytes: number } {
     const counts = this.db.prepare(`
       SELECT
         (SELECT COUNT(*) FROM memory) AS memory_count,
-        (SELECT COUNT(*) FROM docs) AS doc_count,
-        (SELECT COUNT(*) FROM cache) AS cache_count,
+        (SELECT COUNT(*) FROM entries) AS entry_count,
         (SELECT COUNT(*) FROM todos) AS todo_count,
-        (SELECT COUNT(*) FROM context_entries) AS context_count,
         (SELECT COUNT(*) FROM sessions) AS session_count,
         (SELECT COUNT(*) FROM events) AS event_count
-    `).get() as { memory_count: number; doc_count: number; cache_count: number; todo_count: number; context_count: number; session_count: number; event_count: number }
+    `).get() as { memory_count: number; entry_count: number; todo_count: number; session_count: number; event_count: number }
     const pageCount = this.db.prepare('PRAGMA page_count').get() as { page_count: number }
     const pageSize = this.db.prepare('PRAGMA page_size').get() as { page_size: number }
     return { ...counts, db_size_bytes: pageCount.page_count * pageSize.page_size }
   }
+
+  // ─── Import from whimsicality-mcp ───
+
+  importMcp(sourceDir: string): { memory: number; entries: number; errors: string[] } {
+    const errors: string[] = []
+    let memoryCount = 0
+    let entryCount = 0
+    const ts = now()
+
+    const memoryPath = join(sourceDir, 'memory.json')
+    if (existsSync(memoryPath)) {
+      try {
+        const memory = JSON.parse(readFileSync(memoryPath, 'utf-8')) as Record<string, Record<string, { value: string; created_at?: string; updated_at?: string }>>
+        for (const [namespace, keys] of Object.entries(memory)) {
+          for (const [key, entry] of Object.entries(keys)) {
+            try {
+              this.db.prepare(`
+                INSERT OR IGNORE INTO memory (namespace, key, value, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+              `).run(namespace, key, entry.value, entry.created_at ?? ts, entry.updated_at ?? ts)
+              memoryCount++
+            } catch (e) { errors.push(`memory ${namespace}/${key}: ${e instanceof Error ? e.message : String(e)}`) }
+          }
+        }
+      } catch (e) { errors.push(`memory.json: ${e instanceof Error ? e.message : String(e)}`) }
+    }
+
+    const docsPath = join(sourceDir, 'docs.json')
+    if (existsSync(docsPath)) {
+      try {
+        const docs = JSON.parse(readFileSync(docsPath, 'utf-8')) as Record<string, { text: string; language?: string; description?: string; created_at?: string; updated_at?: string }>
+        for (const [docId, doc] of Object.entries(docs)) {
+          try {
+            this.db.prepare(`
+              INSERT OR IGNORE INTO entries (entry_id, title, content_text, is_compressed, original_size, source, created_at, updated_at)
+              VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+            `).run(docId, doc.description ?? '', doc.text, doc.text.length, doc.language ?? '', doc.created_at ?? ts, doc.updated_at ?? ts)
+            entryCount++
+          } catch (e) { errors.push(`doc ${docId}: ${e instanceof Error ? e.message : String(e)}`) }
+        }
+      } catch (e) { errors.push(`docs.json: ${e instanceof Error ? e.message : String(e)}`) }
+    }
+
+    const cacheIndexPath = join(sourceDir, 'cache-index.json')
+    if (existsSync(cacheIndexPath)) {
+      try {
+        const cacheIndex = JSON.parse(readFileSync(cacheIndexPath, 'utf-8')) as Record<string, { topic?: string; summary?: string; tags?: string[]; original_size?: number; compressed_size?: number; created_at?: string; updated_at?: string }>
+        for (const [chunkId, meta] of Object.entries(cacheIndex)) {
+          try {
+            const hash = require('node:crypto').createHash('sha256').update(chunkId).digest('hex')
+            const chunkPath = join(sourceDir, 'cache-chunks', `${hash}.br`)
+            let contentBlob: Buffer | null = null
+            if (existsSync(chunkPath)) {
+              contentBlob = readFileSync(chunkPath)
+            }
+            this.db.prepare(`
+              INSERT OR IGNORE INTO entries (entry_id, title, content, content_text, is_compressed, original_size, source, created_at, updated_at)
+              VALUES (?, ?, ?, ?, 1, ?, '', ?, ?)
+            `).run(chunkId, meta.summary ?? meta.topic ?? '', contentBlob, meta.topic ?? meta.summary ?? '', meta.original_size ?? 0, meta.created_at ?? ts, meta.updated_at ?? ts)
+            if (meta.tags && Array.isArray(meta.tags)) {
+              const rowId = this.db.prepare('SELECT id FROM entries WHERE entry_id = ?').get(chunkId) as { id: number } | undefined
+              if (rowId) {
+                for (const tag of meta.tags) {
+                  if (typeof tag === 'string' && tag.length > 0) {
+                    this.db.prepare('INSERT OR IGNORE INTO entry_tags (entry_id, tag) VALUES (?, ?)').run(rowId.id, tag)
+                  }
+                }
+              }
+            }
+            entryCount++
+          } catch (e) { errors.push(`cache ${chunkId}: ${e instanceof Error ? e.message : String(e)}`) }
+        }
+      } catch (e) { errors.push(`cache-index.json: ${e instanceof Error ? e.message : String(e)}`) }
+    }
+
+    return { memory: memoryCount, entries: entryCount, errors }
+  }
 }
 
-export { MAX_CONTENT_CHARS, MAX_TEXT_CHARS, MAX_IDENTIFIER_CHARS, MAX_TAGS, MAX_TAG_CHARS, DEFAULT_READ_LENGTH, DEFAULT_LIMIT, validateId, validateText, validateTags, toFtsQuery }
+export { MAX_CONTENT_CHARS, MAX_TEXT_CHARS, MAX_IDENTIFIER_CHARS, MAX_TAGS, MAX_TAG_CHARS, DEFAULT_READ_LENGTH, DEFAULT_LIMIT, validateId, validateText, validateTags }

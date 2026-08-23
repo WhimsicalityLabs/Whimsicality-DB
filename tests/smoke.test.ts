@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 
 interface RpcResponse {
   id?: number
-  result?: { serverInfo?: { name: string; version: string }; capabilities?: unknown }
+  result?: { serverInfo?: { name: string; version: string }; capabilities?: unknown; tools?: { name: string; annotations?: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean }[] } }
   error?: unknown
 }
 
@@ -91,22 +91,24 @@ describe('bin smoke test — actual entry point', () => {
       clientInfo: { name: 'smoke-test', version: '1.0' },
     })
     expect(response.result?.serverInfo?.name).toBe('whimsicality-db')
-    expect(response.result?.serverInfo?.version).toBe('0.2.1')
+    expect(response.result?.serverInfo?.version).toBe('0.3.0')
   })
 
-  it('responds to tools/list with annotated tools', async () => {
+  it('responds to tools/list with 21 annotated tools', async () => {
     await proc.call('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
       clientInfo: { name: 'smoke-test', version: '1.0' },
     })
-    const response = await proc.call('tools/list', {}) as RpcResponse & { result?: { tools?: { name: string; annotations?: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean } }[] } }
-    expect(response.result?.tools?.length).toBeGreaterThan(0)
-    const firstTool = response.result?.tools?.[0]
-    expect(firstTool?.annotations?.readOnlyHint).toBeDefined()
-    expect(firstTool?.annotations?.destructiveHint).toBeDefined()
-    expect(firstTool?.annotations?.idempotentHint).toBeDefined()
-    expect(firstTool?.annotations?.openWorldHint).toBeDefined()
+    const response = await proc.call('tools/list', {})
+    const tools = response.result?.tools ?? []
+    expect(tools.length).toBe(21)
+    for (const tool of tools) {
+      expect(tool.annotations?.readOnlyHint).toBeDefined()
+      expect(tool.annotations?.destructiveHint).toBeDefined()
+      expect(tool.annotations?.idempotentHint).toBeDefined()
+      expect(tool.annotations?.openWorldHint).toBeDefined()
+    }
   })
 
   it('handles a full request cycle: init → tools/call → response', async () => {
