@@ -1,0 +1,59 @@
+{
+  "name": "whimsicality-db",
+  "version": "0.1.0",
+  "description": "SQLite-backed MCP server with FTS5 full-text search for truly infinite agent context. Session tracking, event logging, and paged retrieval for long-horizon tasks.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "bin": {
+    "whimsicality-db": "bin/whimsicality-db.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm run typecheck && npm test",
+    "typecheck": "tsc --noEmit",
+    "start": "node bin/whimsicality-db.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "agent",
+    "memory",
+    "sqlite",
+    "fts5",
+    "search",
+    "persistent",
+    "claude",
+    "devin",
+    "long-horizon",
+    "context"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "WhimsicalityLabs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WhimsicalityLabs/Whimsicality-DB.git"
+  },
+  "homepage": "https://github.com/WhimsicalityLabs/Whimsicality-DB",
+  "bugs": {
+    "url": "https://github.com/WhimsicalityLabs/Whimsicality-DB/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.11"
+  }
+}
