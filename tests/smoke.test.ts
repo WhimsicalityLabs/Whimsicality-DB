@@ -91,7 +91,7 @@ describe('bin smoke test — actual entry point', () => {
       clientInfo: { name: 'smoke-test', version: '1.0' },
     })
     expect(response.result?.serverInfo?.name).toBe('whimsicality-db')
-    expect(response.result?.serverInfo?.version).toBe('0.3.1')
+    expect(response.result?.serverInfo?.version).toBe('0.3.2')
   })
 
   it('responds to tools/list with 21 annotated tools', async () => {
