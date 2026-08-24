@@ -5,11 +5,11 @@ import { join } from 'node:path'
 
 const now = (): string => new Date().toISOString()
 
-export interface MemoryEntry { key: string; namespace: string; value: string; created_at: string; updated_at: string }
-export interface EntryRecord { entry_id: string; title: string; is_compressed: boolean; original_size: number; source: string; tags: string[]; created_at: string; updated_at: string }
-export interface TodoEntry { id: number; title: string; description: string; status: string; priority: number; tags: string[]; session_id: string | null; created_at: string; updated_at: string }
-export interface SessionEntry { id: string; name: string; description: string; status: string; created_at: string; updated_at: string }
-export interface EventEntry { id: number; session_id: string | null; event_type: string; content: string; metadata: string; created_at: string }
+export interface MemoryEntry { key: string; ns: string; value: string; created: string; updated: string }
+export interface EntryRecord { id: string; title: string; compressed: boolean; size: number; source: string; tags: string[]; created: string; updated: string }
+export interface TodoEntry { id: number; title: string; description: string; status: string; priority: number; tags: string[]; sid: string | null; created: string; updated: string }
+export interface SessionEntry { id: string; name: string; description: string; status: string; created: string; updated: string }
+export interface EventEntry { id: number; sid: string | null; type: string; content: string; metadata: string; created: string }
 
 export interface SearchResult { collection: string; id: string | number; score: number; [key: string]: unknown }
 
@@ -99,7 +99,7 @@ export class Store {
 
   memoryGet(namespace: string, key: string): MemoryEntry {
     validateId(key, 'key')
-    const row = this.db.prepare('SELECT key, namespace, value, created_at, updated_at FROM memory WHERE namespace = ? AND key = ?').get(namespace, key) as MemoryEntry | undefined
+    const row = this.db.prepare('SELECT key, namespace AS ns, value, created_at AS created, updated_at AS updated FROM memory WHERE namespace = ? AND key = ?').get(namespace, key) as MemoryEntry | undefined
     if (!row) throw new Error(`not found: ${namespace}/${key}`)
     return row
   }
@@ -117,7 +117,7 @@ export class Store {
 
   // ─── Entries (unified: docs + cache + context) ───
 
-  entrySave(entryId: string, text: string, title: string, tags: string[], source: string, compress: boolean | null): { id: string; original_size: number; compressed_size: number; ratio: number } {
+  entrySave(entryId: string, text: string, title: string, tags: string[], source: string, compress: boolean | null): { id: string; size: number; stored: number; ratio: number } {
     validateId(entryId, 'id')
     validateText(text, 'text', MAX_CONTENT_CHARS)
     const shouldCompress = compress === true || (compress === null && text.length > COMPRESS_THRESHOLD)
@@ -141,10 +141,10 @@ export class Store {
       this.syncEntryTags(rowId, tags)
     })
     tx()
-    return { id: entryId, original_size: originalSize, compressed_size: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
+    return { id: entryId, size: originalSize, stored: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
   }
 
-  entryRead(entryId: string, offset: number, length: number): { content: string; title: string; is_compressed: boolean; tags: string[]; source: string; offset: number; length: number; total_length: number; has_more: boolean } {
+  entryRead(entryId: string, offset: number, length: number): { content: string; title: string; compressed: boolean; tags: string[]; source: string; total: number; more: boolean } {
     validateId(entryId, 'id')
     const row = this.db.prepare('SELECT content, content_text, is_compressed, title, source, original_size FROM entries WHERE entry_id = ?').get(entryId) as { content: Buffer | null; content_text: string | null; is_compressed: number; title: string; source: string; original_size: number } | undefined
     if (!row) throw new Error(`not found: ${entryId}`)
@@ -156,13 +156,11 @@ export class Store {
     return {
       content: fullContent.slice(start, end),
       title: row.title,
-      is_compressed: row.is_compressed === 1,
+      compressed: row.is_compressed === 1,
       tags: tagRows.map((t) => t.tag),
       source: row.source,
-      offset: start,
-      length: end - start,
-      total_length: totalLength,
-      has_more: end < totalLength,
+      total: totalLength,
+      more: end < totalLength,
     }
   }
 
@@ -179,7 +177,7 @@ export class Store {
     const result: EntryRecord[] = []
     for (const r of rows) {
       const tagRows = this.db.prepare('SELECT tag FROM entry_tags WHERE entry_id = (SELECT id FROM entries WHERE entry_id = ?)').all(r.entry_id) as { tag: string }[]
-      result.push({ entry_id: r.entry_id, title: r.title, is_compressed: r.is_compressed === 1, original_size: r.original_size, source: r.source, created_at: r.created_at, updated_at: r.updated_at, tags: tagRows.map((t) => t.tag) })
+      result.push({ id: r.entry_id, title: r.title, compressed: r.is_compressed === 1, size: r.original_size, source: r.source, created: r.created_at, updated: r.updated_at, tags: tagRows.map((t) => t.tag) })
     }
     return { results: result }
   }
@@ -197,7 +195,7 @@ export class Store {
     const result: EntryRecord[] = []
     for (const r of rows) {
       const tagRows = this.db.prepare('SELECT tag FROM entry_tags WHERE entry_id = (SELECT id FROM entries WHERE entry_id = ?)').all(r.entry_id) as { tag: string }[]
-      result.push({ entry_id: r.entry_id, title: r.title, is_compressed: r.is_compressed === 1, original_size: r.original_size, source: r.source, created_at: r.created_at, updated_at: r.updated_at, tags: tagRows.map((t) => t.tag) })
+      result.push({ id: r.entry_id, title: r.title, compressed: r.is_compressed === 1, size: r.original_size, source: r.source, created: r.created_at, updated: r.updated_at, tags: tagRows.map((t) => t.tag) })
     }
     return result
   }
@@ -233,7 +231,7 @@ export class Store {
   }
 
   todoList(status: string | null, tag: string | null, sessionId: string | null, limit: number): TodoEntry[] {
-    let sql = 'SELECT DISTINCT t.id, t.title, t.description, t.status, t.priority, t.tags, t.session_id, t.created_at, t.updated_at FROM todos t'
+    let sql = 'SELECT DISTINCT t.id, t.title, t.description, t.status, t.priority, t.tags, t.session_id AS sid, t.created_at AS created, t.updated_at AS updated FROM todos t'
     const conditions: string[] = []
     const params: unknown[] = []
     if (tag) { sql += ' JOIN todo_tags tt ON tt.todo_id = t.id'; conditions.push('tt.tag = ?'); params.push(tag) }
@@ -282,13 +280,13 @@ export class Store {
 
   sessionGet(id: string): SessionEntry {
     validateId(id, 'id')
-    const row = this.db.prepare('SELECT id, name, description, status, created_at, updated_at FROM sessions WHERE id = ?').get(id) as SessionEntry | undefined
+    const row = this.db.prepare('SELECT id, name, description, status, created_at AS created, updated_at AS updated FROM sessions WHERE id = ?').get(id) as SessionEntry | undefined
     if (!row) throw new Error(`not found: session ${id}`)
     return row
   }
 
   sessionList(status: string | null, limit: number): SessionEntry[] {
-    let sql = 'SELECT id, name, description, status, created_at, updated_at FROM sessions'
+    let sql = 'SELECT id, name, description, status, created_at AS created, updated_at AS updated FROM sessions'
     const params: unknown[] = []
     if (status) { sql += ' WHERE status = ?'; params.push(status) }
     sql += ' ORDER BY updated_at DESC LIMIT ?'
@@ -325,7 +323,7 @@ export class Store {
   }
 
   eventList(sessionId: string | null, eventType: string | null, limit: number): EventEntry[] {
-    let sql = 'SELECT id, session_id, event_type, content, metadata, created_at FROM events'
+    let sql = 'SELECT id, session_id AS sid, event_type AS type, content, metadata, created_at AS created FROM events'
     const conditions: string[] = []
     const params: unknown[] = []
     if (sessionId) { conditions.push('session_id = ?'); params.push(sessionId) }
@@ -373,7 +371,7 @@ export class Store {
     }
     if (collections.includes('events')) {
       const rows = this.db.prepare(`
-        SELECT e.id, 'events' AS collection, e.event_type,
+        SELECT e.id, 'events' AS collection, e.event_type AS type,
                snippet(events_fts, 0, '<<', '>>', '…', 32) AS excerpt,
                -bm25(events_fts) AS score
         FROM events_fts JOIN events e ON e.id = events_fts.rowid
@@ -387,18 +385,18 @@ export class Store {
 
   // ─── Stats ───
 
-  stats(): { memory_count: number; entry_count: number; todo_count: number; session_count: number; event_count: number; db_size_bytes: number } {
+  stats(): { memory: number; entries: number; todos: number; sessions: number; events: number; db_bytes: number } {
     const counts = this.db.prepare(`
       SELECT
-        (SELECT COUNT(*) FROM memory) AS memory_count,
-        (SELECT COUNT(*) FROM entries) AS entry_count,
-        (SELECT COUNT(*) FROM todos) AS todo_count,
-        (SELECT COUNT(*) FROM sessions) AS session_count,
-        (SELECT COUNT(*) FROM events) AS event_count
-    `).get() as { memory_count: number; entry_count: number; todo_count: number; session_count: number; event_count: number }
+        (SELECT COUNT(*) FROM memory) AS memory,
+        (SELECT COUNT(*) FROM entries) AS entries,
+        (SELECT COUNT(*) FROM todos) AS todos,
+        (SELECT COUNT(*) FROM sessions) AS sessions,
+        (SELECT COUNT(*) FROM events) AS events
+    `).get() as { memory: number; entries: number; todos: number; sessions: number; events: number }
     const pageCount = this.db.prepare('PRAGMA page_count').get() as { page_count: number }
     const pageSize = this.db.prepare('PRAGMA page_size').get() as { page_size: number }
-    return { ...counts, db_size_bytes: pageCount.page_count * pageSize.page_size }
+    return { ...counts, db_bytes: pageCount.page_count * pageSize.page_size }
   }
 
   // ─── Import from whimsicality-mcp ───
