@@ -275,6 +275,7 @@ DROP TABLE IF EXISTS docs; DROP TABLE IF EXISTS cache; DROP TABLE IF EXISTS cont
 }
 
 export function openDatabase(storageDir: string): Database.Database {
+  mkdirSync(storageDir, { recursive: true })
   const dbPath = join(storageDir, 'whimsicality.db')
   const db = new Database(dbPath)
   db.pragma('journal_mode = WAL')

@@ -28,7 +28,7 @@ const offsetP = { type: 'integer', minimum: 0, description: 'Char offset (defaul
 const lengthP = { type: 'integer', minimum: 1, maximum: MAX_CONTENT_CHARS, description: `Max chars (default ${DEFAULT_READ_LENGTH})` }
 const tagsP = { type: 'array', items: { type: 'string', maxLength: MAX_TAG_CHARS }, maxItems: MAX_TAGS, description: 'Tags' }
 const tagP = { type: 'string', maxLength: MAX_TAG_CHARS, description: 'Filter by tag' }
-const priorityP = { type: 'integer', minimum: 0, maximum: 100, description: 'Priority 0-100 (default 0)' }
+const priorityP = { type: 'integer', minimum: 0, maximum: 100, description: 'Integer priority 0-100, higher=more urgent (default 0)' }
 const rawP = { type: 'boolean', default: false, description: 'Raw FTS5 syntax (AND, OR, NOT, *)' }
 const sidP = os('Session ID', MAX_IDENTIFIER_CHARS)
 const typeP = s('Type: decision|milestone|error|note', 256)
@@ -40,7 +40,7 @@ const TOOLS: readonly ToolDef[] = [
   { name: 'db_memory_list', description: 'List keys in a namespace.', inputSchema: schema({ namespace: os('Namespace (default "default")', MAX_IDENTIFIER_CHARS) }), annotations: RO },
   { name: 'db_memory_delete', description: 'Delete a memory key.', inputSchema: schema({ key: s('Key', MAX_IDENTIFIER_CHARS), namespace: os('Namespace', MAX_IDENTIFIER_CHARS) }, ['key']), annotations: DELETE },
 
-  { name: 'db_entry_save', description: 'Store text. Auto-compresses >64KB. Tags/source optional.', inputSchema: schema({ id: idP, text: s('Text content', MAX_CONTENT_CHARS), title: os('Title/summary', 200), tags: tagsP, source: os('Source (file, URL)', 256), compress: { type: 'boolean', description: 'Force compression' } }, ['id', 'text']), annotations: WRITE },
+  { name: 'db_entry_save', description: 'Store text. Auto-compresses >64KB. When compressed, first 10K chars are FTS-indexed (use db_entry_read for full content). Upsert: saving to existing id replaces content, title, and tags entirely. Tags/source optional.', inputSchema: schema({ id: idP, text: s('Text content', MAX_CONTENT_CHARS), title: os('Title/summary', 200), tags: tagsP, source: os('Source (file, URL)', 256), compress: { type: 'boolean', description: 'Force compression' } }, ['id', 'text']), annotations: WRITE },
   { name: 'db_entry_read', description: 'Read entry by ID. Supports paging.', inputSchema: schema({ id: idP, offset: offsetP, length: lengthP }, ['id']), annotations: RO },
   { name: 'db_entry_list', description: 'List entries. Optional tag filter.', inputSchema: schema({ tag: tagP, limit: limitP }), annotations: RO },
   { name: 'db_entry_by_tags', description: 'Get entries matching any tag.', inputSchema: schema({ tags: { type: 'array', items: { type: 'string' }, description: 'Tags to match' }, limit: limitP }, ['tags']), annotations: RO },
@@ -58,12 +58,18 @@ const TOOLS: readonly ToolDef[] = [
   { name: 'db_event_log', description: 'Log an event in a session. FTS5-searchable.', inputSchema: schema({ sid: sidP, type: typeP, content: s('Event content', MAX_TEXT_CHARS), metadata: os('JSON metadata', MAX_TEXT_CHARS) }, ['type', 'content']), annotations: WRITE },
   { name: 'db_event_list', description: 'List events. Filter by session/type.', inputSchema: schema({ sid: sidP, type: os('Type filter', 256), limit: limitP }), annotations: RO },
 
-  { name: 'db_search', description: 'Unified FTS5 search. BM25 ranked (higher=better).', inputSchema: schema({ query: s('Search query', 10_000), collections: collectionsP, k: topKP, raw: rawP }, ['query']), annotations: RO },
+  { name: 'db_search', description: 'Unified FTS5 search. BM25 ranked (higher=better). Searches memory values, entry text (first 10K chars when compressed), todo titles, event content.', inputSchema: schema({ query: s('Search query', 10_000), collections: collectionsP, k: topKP, raw: rawP }, ['query']), annotations: RO },
   { name: 'db_stats', description: 'Database statistics: counts and size.', inputSchema: schema({}), annotations: RO },
   { name: 'db_import', description: 'Import from whimsicality-mcp storage dir.', inputSchema: schema({ path: s('Path to whimsicality-mcp storage dir', 1024) }, ['path']), annotations: WRITE },
 ]
 
 export function dispatch(store: Store, name: string, args: Record<string, unknown>): unknown {
+  const tool = TOOLS.find((t) => t.name === name)
+  if (!tool) throw new Error(`Unknown tool: ${name}`)
+  const allowed = new Set(Object.keys(tool.inputSchema.properties))
+  for (const key of Object.keys(args)) {
+    if (!allowed.has(key)) throw new Error(`Unknown argument "${key}" for tool ${name}. Allowed: ${[...allowed].join(', ')}`)
+  }
   const id = (n: string): string => validateId(String(args[n] ?? ''), n)
   const text = (n: string, max?: number): string => validateText(String(args[n] ?? ''), n, max)
   const os = (n: string): string => (args[n] === undefined || args[n] === null ? '' : String(args[n]))

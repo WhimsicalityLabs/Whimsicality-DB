@@ -11,9 +11,9 @@ Agents doing long-horizon work have a problem: when the context window fills up,
 `whimsicality-db` solves this with a persistent work journal:
 
 1. **Create a session** for the task: `db_session_create({ id: "refactor-auth", name: "Refactor auth system" })`
-2. **Log events as they happen**: `db_event_log({ session_id: "refactor-auth", event_type: "decision", content: "Chose JWT over session cookies for stateless auth" })`
+2. **Log events as they happen**: `db_event_log({ sid: "refactor-auth", type: "decision", content: "Chose JWT over session cookies for stateless auth" })`
 3. **Search past decisions**: `db_search({ query: "auth decision", collections: ["events"] })`
-4. **Track todos across context windows**: `db_todo_add({ title: "Implement JWT verification", session_id: "refactor-auth" })`
+4. **Track todos across context windows**: `db_todo_add({ title: "Implement JWT verification", sid: "refactor-auth" })`
 
 When the agent comes back after a context window reset, it searches the session log and picks up where it left off — without re-reading the entire conversation.
 
@@ -37,7 +37,7 @@ Data is stored at `~/.whimsicality/db-storage/whimsicality.db` (SQLite, WAL mode
 If you used the deprecated `whimsicality-mcp` package, import your data:
 
 ```
-db_import({ source_dir: "~/.whimsicality/mcp-storage" })
+db_import({ path: "~/.whimsicality/mcp-storage" })
 ```
 
 Imports memory entries, documents, and compressed cache chunks into the unified entries table.
@@ -55,11 +55,11 @@ Imports memory entries, documents, and compressed cache chunks into the unified 
 
 ### Entries — unified text store with auto-compression (5)
 
-Replaces the old docs, cache, and context collections. Small text is stored as-is and FTS5-indexed. Large text (>64KB) is auto-compressed with brotli and paged on read. Tags and source are optional.
+Replaces the old docs, cache, and context collections. Small text is stored as-is and FTS5-indexed. Large text (>64KB) is auto-compressed with brotli; the first 10K chars are kept as plain text for FTS5 indexing, and full content is paged on read via `db_entry_read`. Tags and source are optional. Saving to an existing id replaces content, title, and tags entirely (upsert).
 
 | Tool | Description |
 |---|---|
-| `db_entry_save` | Store text. Auto-compresses if large. Tags and source optional. |
+| `db_entry_save` | Store text. Auto-compresses >64KB. When compressed, first 10K chars are FTS-indexed. Upsert: replaces content, title, and tags entirely. |
 | `db_entry_read` | Read entry by ID. Supports paging via offset+length. |
 | `db_entry_list` | List entries. Optional tag filter. |
 | `db_entry_by_tags` | Get entries matching any of the given tags. |
@@ -69,7 +69,7 @@ Replaces the old docs, cache, and context collections. Small text is stored as-i
 
 | Tool | Description |
 |---|---|
-| `db_todo_add` | Add a todo with priority, tags, session link. |
+| `db_todo_add` | Add a todo with priority (integer 0-100), tags, session link (sid). |
 | `db_todo_list` | List todos. Filter by status/tag/session. |
 | `db_todo_update` | Update a todo. Empty string clears a field. |
 | `db_todo_delete` | Delete a todo. |
@@ -86,7 +86,7 @@ Replaces the old docs, cache, and context collections. Small text is stored as-i
 
 | Tool | Description |
 |---|---|
-| `db_event_log` | Log an event in a session. FTS5-searchable. |
+| `db_event_log` | Log an event in a session (sid). FTS5-searchable. Session must exist. |
 | `db_event_list` | List events. Filter by session/type. |
 
 ### Search + stats + import (3)
@@ -106,7 +106,7 @@ Replaces the old docs, cache, and context collections. Small text is stored as-i
 │  memory       ─── memory_fts (FTS5)                     │
 │  entries      ─── entries_fts (FTS5)                    │
 │    ├─ small:  content_text (plain, FTS5-indexed)        │
-│    └─ large:  content (brotli BLOB) + title (FTS5)      │
+│    └─ large:  content (brotli BLOB) + first 10K (FTS5)  │
 │  entry_tags   ── normalized tag join table               │
 │  todos        ─── todos_fts  (FTS5)                     │
 │  todo_tags    ── normalized tag join table               │
@@ -122,11 +122,11 @@ Replaces the old docs, cache, and context collections. Small text is stored as-i
 
 ### Unified search
 
-`db_search({ query, collections, top_k })` searches across memory, entries, todos, and events in one call. Results are merged and ranked by BM25 score (higher = better). Each result includes its collection, ID, score, and a match-centered excerpt where applicable.
+`db_search({ query, collections, k })` searches across memory, entries, todos, and events in one call. Results are merged and ranked by BM25 score (higher = better). Each result includes its collection, ID, score, and a match-centered excerpt where applicable. For compressed entries, only the first 10K chars of content are indexed — use `db_entry_read` for full content.
 
 ### Auto-compression
 
-Entries above 64KB are automatically brotli-compressed. The title/summary is stored as plain text for FTS5 indexing. `db_entry_read` decompresses on demand with offset+length paging.
+Entries above 64KB are automatically brotli-compressed. The first 10K chars of content are stored as plain text for FTS5 indexing. `db_entry_read` decompresses on demand with offset+length paging.
 
 ### Native module note
 
@@ -159,7 +159,7 @@ npm install
 npm test
 ```
 
-67 tests: 64 in-process (store, search, entries, todos, sessions, events, validation, import) + 3 bin smoke (spawns the actual `bin/whimsicality-db.js` entry point).
+75 tests: 72 in-process (store, search, entries, todos, sessions, events, validation, import, bugfixes) + 3 bin smoke (spawns the actual `bin/whimsicality-db.js` entry point).
 
 ## License
 

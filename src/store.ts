@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 import { brotliCompressSync, brotliDecompressSync } from 'node:zlib'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 const now = (): string => new Date().toISOString()
@@ -21,6 +21,7 @@ const MAX_TAG_CHARS = 256
 const DEFAULT_READ_LENGTH = 8_000
 const DEFAULT_LIMIT = 100
 const COMPRESS_THRESHOLD = 65_536
+const FTS_INDEX_CHARS = 10_000
 
 const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed'])
 const SESSION_STATUSES = new Set(['active', 'paused', 'completed', 'abandoned'])
@@ -129,16 +130,16 @@ export class Store {
     if (shouldCompress) {
       contentBlob = brotliCompressSync(Buffer.from(text, 'utf-8'))
       compressedSize = contentBlob.length
-      contentText = title || text.slice(0, 200)
+      contentText = text.slice(0, FTS_INDEX_CHARS)
     }
     const tx = this.db.transaction(() => {
-      const result = this.db.prepare(`
+      this.db.prepare(`
         INSERT INTO entries (entry_id, title, content, content_text, is_compressed, original_size, source, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(entry_id) DO UPDATE SET title = excluded.title, content = excluded.content, content_text = excluded.content_text, is_compressed = excluded.is_compressed, original_size = excluded.original_size, source = excluded.source, updated_at = excluded.updated_at
       `).run(entryId, title, contentBlob, contentText, shouldCompress ? 1 : 0, originalSize, source, ts, ts)
-      const rowId = Number(result.lastInsertRowid)
-      this.syncEntryTags(rowId, tags)
+      const row = this.db.prepare('SELECT id FROM entries WHERE entry_id = ?').get(entryId) as { id: number } | undefined
+      if (row) this.syncEntryTags(row.id, tags)
     })
     tx()
     return { id: entryId, size: originalSize, stored: compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
@@ -210,6 +211,10 @@ export class Store {
 
   todoAdd(title: string, description: string, priority: number, tags: string[], sessionId: string | null): { id: number } {
     validateText(title, 'title', 10_000)
+    if (sessionId !== null) {
+      const existing = this.db.prepare('SELECT id FROM sessions WHERE id = ?').get(sessionId)
+      if (!existing) throw new Error(`session '${sessionId}' does not exist; create it with db_session_create first`)
+    }
     const ts = now()
     const tagsJson = JSON.stringify(tags)
     const tx = this.db.transaction(() => {
@@ -314,6 +319,10 @@ export class Store {
   eventLog(sessionId: string | null, eventType: string, content: string, metadata: string): { id: number } {
     validateText(eventType, 'event_type', 256)
     validateText(content, 'content', MAX_TEXT_CHARS)
+    if (sessionId !== null) {
+      const existing = this.db.prepare('SELECT id FROM sessions WHERE id = ?').get(sessionId)
+      if (!existing) throw new Error(`session '${sessionId}' does not exist; create it with db_session_create first`)
+    }
     const ts = now()
     const result = this.db.prepare(`
       INSERT INTO events (session_id, event_type, content, metadata, created_at)
@@ -402,12 +411,20 @@ export class Store {
   // ─── Import from whimsicality-mcp ───
 
   importMcp(sourceDir: string): { memory: number; entries: number; errors: string[] } {
+    if (!sourceDir || !existsSync(sourceDir)) throw new Error(`source path does not exist: "${sourceDir}"`)
+    const stat = statSync(sourceDir)
+    if (!stat.isDirectory()) throw new Error(`source path is not a directory: "${sourceDir}"`)
+    const memoryPath = join(sourceDir, 'memory.json')
+    const docsPath = join(sourceDir, 'docs.json')
+    const cacheIndexPath = join(sourceDir, 'cache-index.json')
+    if (!existsSync(memoryPath) && !existsSync(docsPath) && !existsSync(cacheIndexPath)) {
+      throw new Error(`no whimsicality-mcp data found in "${sourceDir}" (expected memory.json, docs.json, or cache-index.json)`)
+    }
     const errors: string[] = []
     let memoryCount = 0
     let entryCount = 0
     const ts = now()
 
-    const memoryPath = join(sourceDir, 'memory.json')
     if (existsSync(memoryPath)) {
       try {
         const memory = JSON.parse(readFileSync(memoryPath, 'utf-8')) as Record<string, Record<string, { value: string; created_at?: string; updated_at?: string }>>
@@ -425,7 +442,6 @@ export class Store {
       } catch (e) { errors.push(`memory.json: ${e instanceof Error ? e.message : String(e)}`) }
     }
 
-    const docsPath = join(sourceDir, 'docs.json')
     if (existsSync(docsPath)) {
       try {
         const docs = JSON.parse(readFileSync(docsPath, 'utf-8')) as Record<string, { text: string; language?: string; description?: string; created_at?: string; updated_at?: string }>
@@ -441,7 +457,6 @@ export class Store {
       } catch (e) { errors.push(`docs.json: ${e instanceof Error ? e.message : String(e)}`) }
     }
 
-    const cacheIndexPath = join(sourceDir, 'cache-index.json')
     if (existsSync(cacheIndexPath)) {
       try {
         const cacheIndex = JSON.parse(readFileSync(cacheIndexPath, 'utf-8')) as Record<string, { topic?: string; summary?: string; tags?: string[]; original_size?: number; compressed_size?: number; created_at?: string; updated_at?: string }>

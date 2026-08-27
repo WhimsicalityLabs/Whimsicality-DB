@@ -441,4 +441,75 @@ describe('whimsicality-db', () => {
       }
     })
   })
+
+  describe('bugfixes', () => {
+    it('rejects unknown arguments instead of silently ignoring them', async () => {
+      const mcp = await readyServer()
+      const response = await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'test', session_id: 'ghost' } })
+      expect(response.result?.isError).toBe(true)
+      expect(text(response)).toContain('session_id')
+    })
+
+    it('rejects db_event_log with nonexistent session id', async () => {
+      const mcp = await readyServer()
+      const response = await mcp.call('tools/call', { name: 'db_event_log', arguments: { sid: 'ghost', type: 'note', content: 'test' } })
+      expect(response.result?.isError).toBe(true)
+      expect(text(response)).toContain('does not exist')
+      expect(text(response)).toContain('db_session_create')
+    })
+
+    it('rejects db_todo_add with nonexistent session id', async () => {
+      const mcp = await readyServer()
+      const response = await mcp.call('tools/call', { name: 'db_todo_add', arguments: { title: 'test', sid: 'ghost' } })
+      expect(response.result?.isError).toBe(true)
+      expect(text(response)).toContain('does not exist')
+    })
+
+    it('indexes compressed entries for search (first 10K chars)', async () => {
+      const mcp = await readyServer()
+      const bigText = 'lorem ipsum '.repeat(6000)
+      await mcp.call('tools/call', { name: 'db_entry_save', arguments: { id: 'big', text: bigText, title: 'Big Doc' } })
+      const searchResult = parsed<{ results: { id: string; collection: string }[] }>(await mcp.call('tools/call', { name: 'db_search', arguments: { query: 'lorem' } }))
+      const entryHit = searchResult.results.find((r) => r.collection === 'entries')
+      expect(entryHit).toBeDefined()
+      expect(entryHit?.id).toBe('big')
+    })
+
+    it('entry save upsert replaces tags entirely', async () => {
+      const mcp = await readyServer()
+      await mcp.call('tools/call', { name: 'db_entry_save', arguments: { id: 'e', text: 'v1', tags: ['alpha', 'beta'] } })
+      await mcp.call('tools/call', { name: 'db_entry_save', arguments: { id: 'e', text: 'v2', tags: ['gamma'] } })
+      const result = parsed<{ tags: string[] }>(await mcp.call('tools/call', { name: 'db_entry_read', arguments: { id: 'e' } }))
+      expect(result.tags).toEqual(['gamma'])
+    })
+
+    it('rejects db_import with nonexistent path', async () => {
+      const mcp = await readyServer()
+      const response = await mcp.call('tools/call', { name: 'db_import', arguments: { path: '/nonexistent/path/xyz' } })
+      expect(response.result?.isError).toBe(true)
+      expect(text(response)).toContain('does not exist')
+    })
+
+    it('rejects db_import with path that has no mcp data', async () => {
+      const mcp = await readyServer()
+      const emptyDir = mkdtempSync(join(tmpdir(), 'whim-empty-'))
+      try {
+        const response = await mcp.call('tools/call', { name: 'db_import', arguments: { path: emptyDir } })
+        expect(response.result?.isError).toBe(true)
+        expect(text(response)).toContain('no whimsicality-mcp data')
+      } finally {
+        try { rmSync(emptyDir, { recursive: true, force: true }) } catch { }
+      }
+    })
+
+    it('auto-creates storage directory if it does not exist', async () => {
+      const nestedDir = join(dir, 'nested', 'deep', 'storage')
+      const db = openDatabase(nestedDir)
+      const store = new Store(db)
+      store.memorySet('default', 'key', 'value')
+      const result = store.memoryGet('default', 'key')
+      expect(result?.value).toBe('value')
+      closeDatabase(db)
+    })
+  })
 })
