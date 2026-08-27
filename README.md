@@ -2,6 +2,8 @@
 
 A work journal for long-running agents. SQLite-backed MCP server with session tracking, event logging, and FTS5 search — so agents working across multiple context windows can recall decisions, search past events, and track their own progress.
 
+[![M8ven Live Monitored](https://m8ven.ai/badge/mcp/whimsicalitylabs-whimsicality-db-14jklr)](https://m8ven.ai/mcp/whimsicalitylabs-whimsicality-db-14jklr
+
 ## Why this exists
 
 Agents doing long-horizon work have a problem: when the context window fills up, they lose track of what they decided, what they tried, and what's left to do. The conversation history scrolls off, and the agent re-derives conclusions it already reached.
